@@ -24,6 +24,10 @@ enum mt7603_eeprom_field {
 
 	MT_EE_TX_POWER_EXT_PA_5G =		0x054,
 
+	/* 2.4 GHz only chips reuse these 5 GHz bytes for the thermal ADC */
+	MT_EE_THADC_ANALOG_PART =		0x053,
+	MT_EE_THADC_SLOPE =			0x054,
+
 	MT_EE_TEMP_SENSOR_CAL =			0x055,
 
 	MT_EE_TX_POWER_0_START_2G =		0x056,
@@ -76,6 +80,8 @@ enum mt7603_eeprom_field {
 	MT_EE_XTAL_TRIM_3_COMP =		0x0f6,
 	MT_EE_XTAL_WF_RFCAL =			0x0f7,
 
+	MT_EE_THERMAL_COMP_OFFSET =		0x0f8,
+
 	__MT_EE_MAX
 };
 
@@ -87,5 +93,11 @@ enum mt7603_eeprom_source {
 
 #define MT_EE_NIC_CONF_0_RX_PATH		GENMASK(3, 0)
 #define MT_EE_NIC_CONF_0_TX_PATH		GENMASK(7, 4)
+
+#define MT_EE_THADC_ANALOG_PART_EN		BIT(7)
+#define MT_EE_THADC_SLOPE_VAL			GENMASK(4, 0)
+
+#define MT_EE_TEMP_SENSOR_CAL_EN		BIT(7)
+#define MT_EE_TEMP_SENSOR_CAL_ADC		GENMASK(6, 0)
 
 #endif

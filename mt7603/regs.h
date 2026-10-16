@@ -583,6 +583,9 @@ enum {
 #define MT_TX_HW_QUEUE_BCN		7
 #define MT_TX_HW_QUEUE_BMC		8
 
+#define MT_TOP_THERMAL			0x80022000
+#define MT_TOP_THERMAL_ADC		GENMASK(14, 8)
+
 #define MT_LED_BASE_PHYS		0x80024000
 #define MT_LED_PHYS(_n)			(MT_LED_BASE_PHYS + (_n))
 

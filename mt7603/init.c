@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 
 #include <linux/etherdevice.h>
+#include <linux/hwmon.h>
+#include <linux/hwmon-sysfs.h>
 #include "mt7603.h"
 #include "mac.h"
 #include "eeprom.h"
@@ -493,6 +495,73 @@ mt7603_init_txpower(struct mt7603_dev *dev,
 	}
 }
 
+static int
+mt7603_get_temperature(struct mt7603_dev *dev)
+{
+	u8 *eeprom = (u8 *)dev->mt76.eeprom.data;
+	int adc, ref_adc = 52, slope = 0;
+
+	adc = mt76_get_field(dev, MT_TOP_THERMAL, MT_TOP_THERMAL_ADC);
+
+	if (eeprom[MT_EE_TEMP_SENSOR_CAL] & MT_EE_TEMP_SENSOR_CAL_EN)
+		ref_adc = FIELD_GET(MT_EE_TEMP_SENSOR_CAL_ADC,
+				    eeprom[MT_EE_TEMP_SENSOR_CAL]);
+
+	if (eeprom[MT_EE_THADC_ANALOG_PART] & MT_EE_THADC_ANALOG_PART_EN) {
+		slope = FIELD_GET(MT_EE_THADC_SLOPE_VAL,
+				  eeprom[MT_EE_THADC_SLOPE]);
+		if (slope > 16)
+			slope -= 32;
+	}
+
+	return (adc - ref_adc) * (56 + slope) / 30 +
+	       eeprom[MT_EE_THERMAL_COMP_OFFSET] + 28;
+}
+
+static ssize_t mt7603_thermal_show_temp(struct device *dev,
+					struct device_attribute *attr,
+					char *buf)
+{
+	struct mt7603_dev *mdev = dev_get_drvdata(dev);
+	int temperature;
+
+	/* the sensor is read through the shared remap window */
+	mutex_lock(&mdev->mt76.mutex);
+	temperature = mt7603_get_temperature(mdev);
+	mutex_unlock(&mdev->mt76.mutex);
+
+	/* display in millidegree celcius */
+	return sprintf(buf, "%d\n", temperature * 1000);
+}
+
+static SENSOR_DEVICE_ATTR(temp1_input, 0444, mt7603_thermal_show_temp,
+			  NULL, 0);
+
+static struct attribute *mt7603_hwmon_attrs[] = {
+	&sensor_dev_attr_temp1_input.dev_attr.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(mt7603_hwmon);
+
+static int mt7603_thermal_init(struct mt7603_dev *dev)
+{
+	struct wiphy *wiphy = mt76_hw(dev)->wiphy;
+	struct device *hwmon;
+	const char *name;
+
+	if (!IS_REACHABLE(CONFIG_HWMON))
+		return 0;
+
+	name = devm_kasprintf(&wiphy->dev, GFP_KERNEL, "mt7603_%s",
+			      wiphy_name(wiphy));
+	if (!name)
+		return -ENOMEM;
+
+	hwmon = devm_hwmon_device_register_with_groups(&wiphy->dev, name, dev,
+						       mt7603_hwmon_groups);
+	return PTR_ERR_OR_ZERO(hwmon);
+}
+
 int mt7603_register_device(struct mt7603_dev *dev)
 {
 	struct mt76_bus_ops *bus_ops;
@@ -558,6 +627,11 @@ int mt7603_register_device(struct mt7603_dev *dev)
 
 	mt7603_init_debugfs(dev);
 	mt7603_init_txpower(dev, &dev->mphy.sband_2g.sband);
+
+	/* the hw is registered already, so do not fail the probe here */
+	ret = mt7603_thermal_init(dev);
+	if (ret)
+		dev_warn(dev->mt76.dev, "failed to register hwmon: %d\n", ret);
 
 	return 0;
 }
