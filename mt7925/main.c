@@ -1005,7 +1005,7 @@ static int mt7925_mac_link_sta_add(struct mt76_dev *mdev,
 	    link_sta == mlink->pri_link) {
 		ret = mt7925_mcu_sta_update(dev, link_sta, vif,
 					    mlink, true,
-					    MT76_STA_INFO_STATE_NONE);
+					    MT76_STA_INFO_STATE_NONE, NULL);
 		if (ret)
 			goto out_pm;
 	} else if (ieee80211_vif_is_mld(vif) &&
@@ -1027,19 +1027,19 @@ static int mt7925_mac_link_sta_add(struct mt76_dev *mdev,
 
 		ret = mt7925_mcu_sta_update(dev, mlink->pri_link, vif,
 					    pri_mlink, true,
-					    MT76_STA_INFO_STATE_ASSOC);
+					    MT76_STA_INFO_STATE_ASSOC, mlink);
 		if (ret)
 			goto out_pm;
 
 		ret = mt7925_mcu_sta_update(dev, link_sta, vif,
 					    mlink, true,
-					    MT76_STA_INFO_STATE_ASSOC);
+					    MT76_STA_INFO_STATE_ASSOC, mlink);
 		if (ret)
 			goto out_pm;
 	} else {
 		ret = mt7925_mcu_sta_update(dev, link_sta, vif,
 					    mlink, true,
-					    MT76_STA_INFO_STATE_NONE);
+					    MT76_STA_INFO_STATE_NONE, NULL);
 		if (ret)
 			goto out_pm;
 	}
@@ -1247,7 +1247,7 @@ static void mt7925_mac_link_sta_assoc(struct mt76_dev *mdev,
 	memset(mlink->airtime_ac, 0, sizeof(mlink->airtime_ac));
 
 	mt7925_mcu_sta_update(dev, link_sta, vif, mlink, true,
-			      MT76_STA_INFO_STATE_ASSOC);
+			      MT76_STA_INFO_STATE_ASSOC, NULL);
 
 	mt792x_mutex_release(dev);
 }
@@ -1257,6 +1257,13 @@ int mt7925_mac_sta_event(struct mt76_dev *mdev, struct ieee80211_vif *vif,
 {
 	struct mt792x_dev *dev = container_of(mdev, struct mt792x_dev, mt76);
 	struct ieee80211_link_sta *link_sta = &sta->deflink;
+	struct mt792x_vif *mvif = (struct mt792x_vif *)vif->drv_priv;
+
+	if (mvif->roc_join_held && !sta->tdls &&
+	    (ev == MT76_STA_EVENT_AUTHORIZE || ev == MT76_STA_EVENT_DISASSOC)) {
+		mvif->roc_join_held = false;
+		mt7925_abort_roc(mvif->phy, &mvif->bss_conf);
+	}
 
 	switch (ev) {
 	case MT76_STA_EVENT_ASSOC:
@@ -1307,7 +1314,7 @@ static void mt7925_mac_link_sta_remove(struct mt76_dev *mdev,
 	mt76_connac_pm_wake(&dev->mphy, &dev->pm);
 
 	mt7925_mcu_sta_update(dev, link_sta, vif, mlink, false,
-			      MT76_STA_INFO_STATE_NONE);
+			      MT76_STA_INFO_STATE_NONE, NULL);
 	mt7925_mac_wtbl_update(dev, mlink->wcid.idx,
 			       MT_WTBL_UPDATE_ADM_COUNT_CLEAR);
 
@@ -1452,6 +1459,7 @@ void mt7925_mac_sta_remove(struct mt76_dev *mdev, struct ieee80211_vif *vif,
 
 	if (vif->type == NL80211_IFTYPE_STATION) {
 		mvif->wep_sta = NULL;
+		mvif->roc_join_held = false;
 		ewma_rssi_init(&mvif->bss_conf.rssi);
 	}
 
@@ -1978,7 +1986,7 @@ mt7925_start_ap(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 
 	err = mt7925_mcu_sta_update(dev, NULL, vif,
 				    &mvif->sta.deflink, true,
-				    MT76_STA_INFO_STATE_NONE);
+				    MT76_STA_INFO_STATE_NONE, NULL);
 out:
 	mt792x_mutex_release(dev);
 
@@ -2077,6 +2085,7 @@ mt7925_change_chanctx(struct ieee80211_hw *hw,
 						      link_conf, ctx);
 		}
 	}
+	mt76_phy_chandef_set(mvif->phy->mt76, &ctx->def);
 
 	mt792x_mutex_release(phy->dev);
 }
@@ -2103,6 +2112,19 @@ static void mt7925_mgd_complete_tx(struct ieee80211_hw *hw,
 {
 	struct mt792x_vif *mvif = (struct mt792x_vif *)vif->drv_priv;
 
+	/* Keep the join ROC until the station is authorized, so that it
+	 * covers the 4-way handshake. mt7925_mac_sta_event() releases it.
+	 * On MLD, the active ROC is the MLO ROC, which must be released
+	 * before the link activation work sets its own.
+	 */
+	if (vif->type == NL80211_IFTYPE_STATION && !ieee80211_vif_is_mld(vif) &&
+	    info->success &&
+	    (info->subtype == IEEE80211_STYPE_ASSOC_REQ ||
+	     info->subtype == IEEE80211_STYPE_REASSOC_REQ)) {
+		mvif->roc_join_held = true;
+		return;
+	}
+
 	mt7925_abort_roc(mvif->phy, &mvif->bss_conf);
 }
 
@@ -2122,7 +2144,7 @@ static void mt7925_vif_cfg_changed(struct ieee80211_hw *hw,
 	if (changed & BSS_CHANGED_ASSOC) {
 		mt7925_mcu_sta_update(dev, NULL, vif,
 				      &mvif->sta.deflink, true,
-				      MT76_STA_INFO_STATE_ASSOC);
+				      MT76_STA_INFO_STATE_ASSOC, NULL);
 		mt7925_mcu_set_beacon_filter(dev, vif, vif->cfg.assoc);
 
 		if (ieee80211_vif_is_mld(vif))
@@ -2425,6 +2447,7 @@ static int mt7925_assign_vif_chanctx(struct ieee80211_hw *hw,
 
 	mconf->mt76.ctx = ctx;
 	mctx->bss_conf = mconf;
+	mt76_phy_chandef_set(mvif->phy->mt76, &ctx->def);
 	mutex_unlock(&dev->mt76.mutex);
 
 	return 0;
