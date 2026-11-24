@@ -87,8 +87,10 @@ int mt7915_run(struct ieee80211_hw *hw)
 		ieee80211_queue_delayed_work(hw, &phy->mt76->mac_work,
 					     MT7915_WATCHDOG_TIME);
 
-	if (!running)
+	if (!running || !phy->counter_reset) {
 		mt7915_mac_reset_counters(phy);
+		phy->counter_reset = true;
+	}
 
 out:
 	return ret;
@@ -741,18 +743,6 @@ mt7915_stop_ap(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 }
 
 static void
-mt7915_channel_switch_beacon(struct ieee80211_hw *hw,
-			     struct ieee80211_vif *vif,
-			     struct cfg80211_chan_def *chandef)
-{
-	struct mt7915_dev *dev = mt7915_hw_dev(hw);
-
-	mutex_lock(&dev->mt76.mutex);
-	mt7915_mcu_add_beacon(hw, vif, true, BSS_CHANGED_BEACON);
-	mutex_unlock(&dev->mt76.mutex);
-}
-
-static void
 mt7915_sta_vow_set_airtime_weight(struct mt7915_dev *dev,
 				  struct mt7915_sta *msta, u16 weight)
 {
@@ -909,9 +899,19 @@ void mt7915_mac_sta_remove(struct mt76_dev *mdev, struct ieee80211_vif *vif,
 {
 	struct mt7915_dev *dev = container_of(mdev, struct mt7915_dev, mt76);
 	struct mt7915_sta *msta = (struct mt7915_sta *)sta->drv_priv;
+	int i;
 
 	mt7915_mac_wtbl_update(dev, msta->wcid.idx,
 			       MT_WTBL_UPDATE_ADM_COUNT_CLEAR);
+
+	/* the firmware can still hold an agreement whose delete failed, so
+	 * its table entry stays counted
+	 */
+	for (i = 0; i < ARRAY_SIZE(msta->twt.flow); i++) {
+		if (msta->twt.flowid_mask & BIT(i))
+			list_del_init(&msta->twt.flow[i].list);
+	}
+	msta->twt.flowid_mask = 0;
 
 	spin_lock_bh(&mdev->sta_poll_lock);
 	if (!list_empty(&msta->wcid.poll_list))
@@ -1880,7 +1880,6 @@ const struct ieee80211_ops mt7915_ops = {
 	.release_buffered_frames = mt76_release_buffered_frames,
 	.get_txpower = mt76_get_txpower,
 	.set_sar_specs = mt7915_set_sar_specs,
-	.channel_switch_beacon = mt7915_channel_switch_beacon,
 	.get_stats = mt7915_get_stats,
 	.get_et_sset_count = mt7915_get_et_sset_count,
 	.get_et_stats = mt7915_get_et_stats,

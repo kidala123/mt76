@@ -306,47 +306,10 @@ static int
 mt7996_fw_debug_wm_set(void *data, u64 val)
 {
 	struct mt7996_dev *dev = data;
-	enum {
-		DEBUG_TXCMD = 62,
-		DEBUG_CMD_RPT_TX,
-		DEBUG_CMD_RPT_TRIG,
-		DEBUG_SPL,
-		DEBUG_RPT_RX,
-		DEBUG_RPT_RA = 68,
-	} debug;
-	bool tx, rx, en;
-	int ret;
 
 	dev->fw_debug_wm = val ? MCU_FW_LOG_TO_HOST : 0;
 
-	if (dev->fw_debug_bin)
-		val = MCU_FW_LOG_RELAY;
-	else
-		val = dev->fw_debug_wm;
-
-	tx = dev->fw_debug_wm || (dev->fw_debug_bin & BIT(1));
-	rx = dev->fw_debug_wm || (dev->fw_debug_bin & BIT(2));
-	en = dev->fw_debug_wm || (dev->fw_debug_bin & BIT(0));
-
-	ret = mt7996_mcu_fw_log_2_host(dev, MCU_FW_LOG_WM, val);
-	if (ret)
-		return ret;
-
-	for (debug = DEBUG_TXCMD; debug <= DEBUG_RPT_RA; debug++) {
-		if (debug == 67)
-			continue;
-
-		if (debug == DEBUG_RPT_RX)
-			val = en && rx;
-		else
-			val = en && tx;
-
-		ret = mt7996_mcu_fw_dbg_ctrl(dev, debug, val);
-		if (ret)
-			return ret;
-	}
-
-	return 0;
+	return mt7996_mcu_fw_debug_set(dev, MCU_FW_LOG_WM, false);
 }
 
 static int
@@ -366,16 +329,10 @@ static int
 mt7996_fw_debug_wa_set(void *data, u64 val)
 {
 	struct mt7996_dev *dev = data;
-	int ret;
 
 	dev->fw_debug_wa = val ? MCU_FW_LOG_TO_HOST : 0;
 
-	ret = mt7996_mcu_fw_log_2_host(dev, MCU_FW_LOG_WA, dev->fw_debug_wa);
-	if (ret)
-		return ret;
-
-	return mt7996_mcu_wa_cmd(dev, MCU_WA_PARAM_CMD(SET), MCU_WA_PARAM_PDMA_RX,
-				 !!dev->fw_debug_wa, 0);
+	return mt7996_mcu_fw_debug_set(dev, MCU_FW_LOG_WA, false);
 }
 
 static int
@@ -904,11 +861,11 @@ mt7996_twt_stats(struct seq_file *s, void *data)
 	struct mt7996_dev *dev = dev_get_drvdata(s->private);
 	struct mt7996_twt_flow *iter;
 
-	rcu_read_lock();
+	mutex_lock(&dev->mt76.mutex);
 
 	seq_puts(s, "     wcid |       id |    flags |      exp | mantissa");
 	seq_puts(s, " | duration |            tsf |\n");
-	list_for_each_entry_rcu(iter, &dev->twt_list, list)
+	list_for_each_entry(iter, &dev->twt_list, list)
 		seq_printf(s,
 			   "%9d | %8d | %5c%c%c%c | %8d | %8d | %8d | %14lld |\n",
 			   iter->wcid, iter->id,
@@ -919,7 +876,7 @@ mt7996_twt_stats(struct seq_file *s, void *data)
 			   iter->exp, iter->mantissa,
 			   iter->duration, iter->tsf);
 
-	rcu_read_unlock();
+	mutex_unlock(&dev->mt76.mutex);
 
 	return 0;
 }

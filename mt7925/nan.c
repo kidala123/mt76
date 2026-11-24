@@ -4,6 +4,7 @@
 #include <asm/byteorder.h>
 #include <linux/bitfield.h>
 #include <linux/errno.h>
+#include <linux/etherdevice.h>
 #include <linux/kernel.h>
 #include <linux/stddef.h>
 #include <linux/string.h>
@@ -326,6 +327,165 @@ mt7925_nan_seed_link_sta(struct mt792x_dev *dev,
 	return nan_ctx;
 }
 
+/* Hand the DW-WTBL STA's WTBL index down to the firmware, which gates the
+ * queue by index alone - no address has to be agreed on. Until the index
+ * arrives the firmware's gate stays disarmed, so a failure here degrades
+ * to stock (ungated) management TX rather than breaking NAN.
+ */
+static int mt7925_nan_set_dw_wtbl_idx(struct mt792x_dev *dev, u16 wlan_idx)
+{
+	struct {
+		u8 rsv[4];
+		struct mt7925_nan_dw_wtbl_idx_tlv tlv;
+	} cmd = {
+		.tlv = {
+			.tag = cpu_to_le16(NAN_UNI_CMD_DW_WTBL_IDX),
+			.len = cpu_to_le16(sizeof(struct mt7925_nan_dw_wtbl_idx_tlv)),
+			.wlan_idx = cpu_to_le16(wlan_idx),
+		},
+	};
+
+	return mt76_mcu_send_msg(&dev->mt76, MCU_UNI_CMD(NAN), &cmd,
+				 sizeof(cmd), true);
+}
+
+/* Create the DW-WTBL STA and steer host mgmt TX onto it. The firmware is
+ * handed its WTBL index and holds that queue outside the DW, so unicast
+ * discovery only airs when every synced peer is awake. Best-effort: on
+ * failure the stock path keeps mgmt on the interface WTBL.
+ */
+static void mt7925_nan_dw_wcid_setup(struct mt792x_dev *dev,
+				     struct ieee80211_vif *vif)
+{
+	struct mt792x_vif *mvif = (struct mt792x_vif *)vif->drv_priv;
+	struct mt792x_bss_conf *mconf = &mvif->bss_conf;
+	struct mt76_wcid *own = &mvif->sta.deflink.wcid;
+	struct sta_rec_basic *basic;
+	struct mt76_txq *mtxq;
+	struct sk_buff *skb;
+	struct tlv *tlv;
+	int idx, ret;
+
+	if (mvif->nan_dw_wcid.idx > 0 &&
+	    mvif->nan_dw_wcid.idx < MT792x_WTBL_STA)
+		return;
+
+	idx = mt76_wcid_alloc(dev->mt76.wcid_mask, MT792x_WTBL_STA - 1);
+	if (idx < 0)
+		goto err;
+
+	mvif->nan_dw_wcid.idx = idx;
+	mvif->nan_dw_wcid.phy_idx = own->phy_idx;
+	mvif->nan_dw_wcid.nan_dw = 1;
+	mvif->nan_dw_wcid.tx_info |= MT_WCID_TX_INFO_SET;
+	mt76_wcid_init(&mvif->nan_dw_wcid, mconf->mt76.band_idx);
+	mt7925_mac_wtbl_update(dev, idx, MT_WTBL_UPDATE_ADM_COUNT_CLEAR);
+
+	skb = __mt76_connac_mcu_alloc_sta_req(&dev->mt76, &mconf->mt76,
+					      &mvif->nan_dw_wcid,
+					      MT7925_STA_UPDATE_MAX_SIZE);
+	if (IS_ERR(skb))
+		goto err_free;
+
+	tlv = mt76_connac_mcu_add_tlv(skb, STA_REC_BASIC, sizeof(*basic));
+	basic = (struct sta_rec_basic *)tlv;
+	basic->conn_type = cpu_to_le32(CONNECTION_NAN);
+	basic->conn_state = CONN_STATE_PORT_SECURE;
+	basic->extra_info = cpu_to_le16(EXTRA_INFO_VER | EXTRA_INFO_NEW);
+	/* The record needs an address but nothing ever matches on it: frame
+	 * headers carry the real NMI/peer addresses and the firmware gates the
+	 * queue by WTBL index. Any locally administered address will do.
+	 */
+	eth_random_addr(basic->peer_addr);
+
+	/* A bare STA_REC leaves the WTBL rate table unconfigured and HW
+	 * unicast from it crawls (multi-second delivery). Give it the NAN
+	 * base rates: OFDM+ERP, no CCK.
+	 */
+	{
+		struct sta_rec_phy *phy;
+		struct sta_rec_ra_info *ra_info;
+
+		tlv = mt76_connac_mcu_add_tlv(skb, STA_REC_PHY, sizeof(*phy));
+		phy = (struct sta_rec_phy *)tlv;
+		phy->phy_type = PHY_TYPE_BIT_OFDM | PHY_TYPE_BIT_ERP;
+		phy->basic_rate = cpu_to_le16(0x150);
+
+		tlv = mt76_connac_mcu_add_tlv(skb, STA_REC_RA,
+					      sizeof(*ra_info));
+		ra_info = (struct sta_rec_ra_info *)tlv;
+		ra_info->legacy = cpu_to_le16(FIELD_PREP(RA_LEGACY_OFDM, 0xff));
+	}
+
+	/* Drive the record to the associated state: firmware buffers TX for
+	 * a STA that never left the initial state, which shows up as NAFs
+	 * sitting in the queue for seconds and then failing.
+	 */
+	{
+		struct sta_rec_state_v2 *state;
+
+		tlv = mt76_connac_mcu_add_tlv(skb, STA_REC_STATE,
+					      sizeof(*state));
+		state = (struct sta_rec_state_v2 *)tlv;
+		state->state = MT76_STA_INFO_STATE_ASSOC;
+	}
+
+	ret = mt76_mcu_skb_send_msg(&dev->mt76, skb,
+				    MCU_UNI_CMD(STA_REC_UPDATE), true);
+	if (ret)
+		goto err_free;
+
+	rcu_assign_pointer(dev->mt76.wcid[idx], &mvif->nan_dw_wcid);
+
+	/* Arm the firmware's DW gate for this WTBL index; on failure the gate
+	 * stays disarmed and management TX degrades to stock (ungated).
+	 */
+	ret = mt7925_nan_set_dw_wtbl_idx(dev, idx);
+	if (ret)
+		dev_warn(dev->mt76.dev,
+			 "NAN: DW-WTBL index handoff failed (%d)\n", ret);
+
+	if (vif->txq_mgmt) {
+		mtxq = (struct mt76_txq *)vif->txq_mgmt->drv_priv;
+		mtxq->wcid = idx;
+	}
+
+	dev_info(dev->mt76.dev, "NAN DW-WTBL up: wcid=%d\n", idx);
+	return;
+
+err_free:
+	mt76_wcid_cleanup(&dev->mt76, &mvif->nan_dw_wcid);
+	mt76_wcid_mask_clear(dev->mt76.wcid_mask, idx);
+	mvif->nan_dw_wcid.idx = 0;
+err:
+	dev_warn(dev->mt76.dev, "NAN DW-WTBL setup failed, stock mgmt path\n");
+}
+
+/* Rebind host mgmt TX to the interface WTBL and drop the DW-WTBL STA.
+ * The firmware frees the STA record (and force-releases the gate) as
+ * part of NAN disable, so only the driver-side wcid is torn down here.
+ */
+void mt7925_nan_dw_wcid_release(struct mt792x_dev *dev,
+				struct ieee80211_vif *vif)
+{
+	struct mt792x_vif *mvif = (struct mt792x_vif *)vif->drv_priv;
+	struct mt76_txq *mtxq;
+	int idx = mvif->nan_dw_wcid.idx;
+
+	if (idx <= 0 || idx >= MT792x_WTBL_STA)
+		return;
+
+	if (vif->txq_mgmt) {
+		mtxq = (struct mt76_txq *)vif->txq_mgmt->drv_priv;
+		mtxq->wcid = mvif->sta.deflink.wcid.idx;
+	}
+
+	rcu_assign_pointer(dev->mt76.wcid[idx], NULL);
+	mt76_wcid_cleanup(&dev->mt76, &mvif->nan_dw_wcid);
+	mt76_wcid_mask_clear(dev->mt76.wcid_mask, idx);
+	mvif->nan_dw_wcid.idx = 0;
+}
+
 int mt7925_nan_enable(struct ieee80211_vif *vif,
 		      struct mt792x_dev *dev,
 		      struct cfg80211_nan_conf *conf)
@@ -335,6 +495,7 @@ int mt7925_nan_enable(struct ieee80211_vif *vif,
 	struct mt7925_nan_common_hdr *hdr;
 	struct mt7925_nan_enable_req_tlv *req;
 	struct sk_buff *skb;
+	int ret;
 
 	if (!vif || !dev || !conf)
 		return -EINVAL;
@@ -374,7 +535,13 @@ int mt7925_nan_enable(struct ieee80211_vif *vif,
 
 	mt7925_nan_update_conf(mvif, conf);
 
-	return mt76_mcu_skb_send_msg(mdev, skb, MCU_UNI_CMD(NAN), true);
+	ret = mt76_mcu_skb_send_msg(mdev, skb, MCU_UNI_CMD(NAN), true);
+	if (ret)
+		return ret;
+
+	mt7925_nan_dw_wcid_setup(dev, vif);
+
+	return 0;
 }
 
 int mt7925_nan_disable(struct ieee80211_vif *vif, struct mt792x_dev *dev)
@@ -393,6 +560,9 @@ int mt7925_nan_disable(struct ieee80211_vif *vif, struct mt792x_dev *dev)
 
 	if (!dev)
 		return -EINVAL;
+
+	if (vif)
+		mt7925_nan_dw_wcid_release(dev, vif);
 
 	return mt76_mcu_send_msg(mdev, MCU_UNI_CMD(NAN), &nan_cmd, sizeof(nan_cmd), true);
 }
@@ -534,19 +704,29 @@ mt7925_nan_mcu_handle_de_event(struct mt792x_dev *dev, struct tlv *tlv)
 		return;
 	}
 
-	if (!dev->nan_vif || !ieee80211_vif_nan_started(dev->nan_vif)) {
-		dev_warn(dev->mt76.dev, "nan: joined-cluster event but NAN not started\n");
-		return;
-	}
-
 	dev_dbg(dev->mt76.dev, "nan: anchor_master_rank=%*phN\n",
 		NAN_ANCHOR_MASTER_RANK_NUM, de_evt->anchor_master_rank);
 
 	dev_dbg(dev->mt76.dev, "nan: own_nmi=%pM master_nmi=%pM\n",
 		de_evt->own_nmi, de_evt->master_nmi);
 
-	/* joined an existing cluster, not a self-anchored new one */
-	ieee80211_nan_cluster_joined(dev->nan_vif, cluster_id, false, GFP_KERNEL);
+	/* JOINED_CLUSTER has the same race as STARTED_CLUSTER above (the
+	 * firmware joins from inside its start-up passive scan, so the event
+	 * can land while NAN_START is still running), and it can also race
+	 * the work that is about to deliver a deferred STARTED_CLUSTER -
+	 * userspace keeps the last event it sees, so a directly sent JOINED
+	 * would be overwritten by the stale self cluster for the whole
+	 * session. Always deliver JOINED through the work, which sends
+	 * STARTED before JOINED.
+	 */
+	dev_dbg(dev->mt76.dev, "nan: deferring JOINED_CLUSTER cluster=%pM\n",
+		cluster_id);
+	spin_lock_bh(&dev->nan_deferred_lock);
+	memcpy(dev->nan_joined_cluster_id, cluster_id, ETH_ALEN);
+	set_bit(MT7925_NAN_DEFERRED_JOINED_CLUSTER,
+		&dev->nan_deferred_pending);
+	spin_unlock_bh(&dev->nan_deferred_lock);
+	ieee80211_queue_work(dev->mt76.hw, &dev->nan_deferred_work);
 }
 
 /* Runs the deferred NAN MCU events in process context; takes wiphy_lock
@@ -557,6 +737,7 @@ mt7925_nan_deferred_work(struct work_struct *work)
 {
 	struct mt792x_dev *dev = container_of(work, struct mt792x_dev,
 					      nan_deferred_work);
+	u8 joined_cluster_id[ETH_ALEN];
 	struct ieee80211_vif *vif;
 	unsigned long pending;
 	u8 cluster_id[ETH_ALEN];
@@ -565,6 +746,7 @@ mt7925_nan_deferred_work(struct work_struct *work)
 	pending = dev->nan_deferred_pending;
 	dev->nan_deferred_pending = 0;
 	memcpy(cluster_id, dev->nan_started_cluster_id, ETH_ALEN);
+	memcpy(joined_cluster_id, dev->nan_joined_cluster_id, ETH_ALEN);
 	spin_unlock_bh(&dev->nan_deferred_lock);
 
 	if (!pending)
@@ -577,6 +759,10 @@ mt7925_nan_deferred_work(struct work_struct *work)
 
 	if (test_bit(MT7925_NAN_DEFERRED_STARTED_CLUSTER, &pending))
 		ieee80211_nan_cluster_joined(vif, cluster_id, true, GFP_KERNEL);
+
+	if (test_bit(MT7925_NAN_DEFERRED_JOINED_CLUSTER, &pending))
+		ieee80211_nan_cluster_joined(vif, joined_cluster_id, false,
+					     GFP_KERNEL);
 
 	if (test_bit(MT7925_NAN_DEFERRED_SCHED_UPDATE_DONE, &pending))
 		ieee80211_nan_sched_update_done(vif);
@@ -651,6 +837,44 @@ mt7925_nan_handle_sched_update_done(struct mt792x_dev *dev, struct tlv *tlv)
 	ieee80211_queue_work(dev->mt76.hw, &dev->nan_deferred_work);
 }
 
+static void
+mt7925_nan_handle_lowpower_ctrl(struct mt792x_dev *dev, struct tlv *tlv)
+{
+	struct mt7925_nan_lowpower_ctrl_evt *evt;
+	struct mt792x_vif *mvif;
+	u16 len;
+
+	if (!dev || !tlv)
+		return;
+
+	len = le16_to_cpu(tlv->len);
+	if (len < sizeof(*tlv) + sizeof(*evt)) {
+		dev_warn(dev->mt76.dev,
+			 "nan: short lowpower_ctrl event tlv len=%u\n", len);
+		return;
+	}
+
+	if (!dev->nan_vif || !ieee80211_vif_nan_started(dev->nan_vif))
+		return;
+
+	evt = (struct mt7925_nan_lowpower_ctrl_evt *)tlv->data;
+
+	dev_dbg(dev->mt76.dev,
+		"nan: lowpower_ctrl event - peer_sch_record_tx_map=0x%x\n",
+		evt->peer_sch_record_tx_map);
+
+	if (!evt->peer_sch_record_tx_map)
+		return;
+
+	/*
+	 * Firmware reports an active peer schedule; remember it so the
+	 * next resume re-enables low power event reporting instead of
+	 * sending the command unconditionally every suspend/resume cycle.
+	 */
+	mvif = (struct mt792x_vif *)dev->nan_vif->drv_priv;
+	mvif->nan.lowpower_mode = true;
+}
+
 void mt7925_nan_mcu_event(struct mt792x_dev *dev, struct sk_buff *skb)
 {
 	struct tlv *tlv;
@@ -685,6 +909,9 @@ void mt7925_nan_mcu_event(struct mt792x_dev *dev, struct sk_buff *skb)
 		case NAN_UNI_EVENT_ID_SCHED_UPDATE_DONE:
 			mt7925_nan_handle_sched_update_done(dev, tlv);
 			break;
+		case NAN_UNI_EVENT_LOWPOWER_CTRL:
+			mt7925_nan_handle_lowpower_ctrl(dev, tlv);
+			break;
 		default:
 			break;
 		}
@@ -692,6 +919,180 @@ void mt7925_nan_mcu_event(struct mt792x_dev *dev, struct sk_buff *skb)
 		tlv_len -= len;
 		tlv = (struct tlv *)((u8 *)tlv + len);
 	}
+}
+
+int mt7925_nan_send_lowpower_ctrl_cmd(struct mt792x_dev *dev, bool enable)
+{
+	struct mt7925_nan_lowpower_ctrl_tlv *lp_tlv;
+	struct mt7925_nan_common_hdr *hdr;
+	struct mt792x_vif *mvif;
+	struct mt76_dev *mdev;
+	struct sk_buff *skb;
+	struct tlv *tlv;
+
+	if (!dev)
+		return -EINVAL;
+
+	/*
+	 * Only re-enabling (on resume) is gated on firmware having reported
+	 * an active peer schedule while suspended; disabling (on suspend)
+	 * always goes through so firmware stops reporting immediately.
+	 */
+	if (enable) {
+		if (!dev->nan_vif)
+			return 0;
+
+		mvif = (struct mt792x_vif *)dev->nan_vif->drv_priv;
+		if (!mvif->nan.lowpower_mode)
+			return 0;
+
+		mvif->nan.lowpower_mode = false;
+	}
+
+	mdev = &dev->mt76;
+
+	skb = mt76_mcu_msg_alloc(mdev, NULL,
+				 sizeof(struct mt7925_nan_common_hdr) +
+				 sizeof(struct mt7925_nan_lowpower_ctrl_tlv));
+	if (!skb)
+		return -ENOMEM;
+
+	hdr = (struct mt7925_nan_common_hdr *)skb_put(skb, sizeof(*hdr));
+	memset(hdr, 0, sizeof(*hdr));
+
+	tlv = mt76_connac_mcu_add_tlv(skb, NAN_UNI_CMD_LOWPOWER_CTRL,
+				      sizeof(struct mt7925_nan_lowpower_ctrl_tlv));
+	if (!tlv) {
+		dev_kfree_skb(skb);
+		return -ENOMEM;
+	}
+
+	lp_tlv = (struct mt7925_nan_lowpower_ctrl_tlv *)tlv;
+	lp_tlv->enabled = enable ? 1 : 0;
+
+	return mt76_mcu_skb_send_msg(mdev, skb, MCU_UNI_CMD(NAN), true);
+}
+
+static int
+mt7925_nan_key_mgmt_tlv(struct sk_buff *skb,
+			enum mt7925_nan_key_operation key_op,
+			enum mt7925_nan_key_type key_type,
+			u16 wtbl_entry,
+			const u8 *local_addr,
+			const u8 *peer_addr,
+			const struct mt7925_nan_key_info *key)
+{
+	struct mt7925_nan_key_mgmt_tlv *key_mgmt_tlv = NULL;
+	struct tlv *tlv = NULL;
+
+	if (!skb)
+		return -EINVAL;
+
+	tlv = mt76_connac_mcu_add_tlv(skb, NAN_UNI_CMD_KEY_MANAGEMENT,
+				      sizeof(struct mt7925_nan_key_mgmt_tlv));
+	if (!tlv)
+		return -ENOMEM;
+
+	key_mgmt_tlv = (struct mt7925_nan_key_mgmt_tlv *)tlv;
+	key_mgmt_tlv->op = (u8)key_op;
+	key_mgmt_tlv->key_type = (u8)key_type;
+	key_mgmt_tlv->wtbl_idx = cpu_to_le16(wtbl_entry);
+	key_mgmt_tlv->init = 1;
+	key_mgmt_tlv->key_exist = 0;
+	key_mgmt_tlv->is_nmi_tk = 0;
+
+	memcpy(key_mgmt_tlv->local_addr, local_addr, ETH_ALEN);
+	memcpy(key_mgmt_tlv->peer_addr, peer_addr, ETH_ALEN);
+
+	switch (key_type) {
+	case NAN_KEY_TYPE_NMI_CXT_MGMT_KEY:
+		key_mgmt_tlv->nmi_key_idx = 0;
+		key_mgmt_tlv->is_nmi_tk = true;
+		break;
+	case NAN_KEY_TYPE_MC_TX_KEY:
+	case NAN_KEY_TYPE_MC_MGMT_TX_KEY:
+		/* TX GTK/IGTK/BIGTK: NDI-indexed slot; NDC ID not yet tracked */
+		key_mgmt_tlv->ndi_idx = 0;
+		break;
+	case NAN_KEY_TYPE_MC_RX_KEY:
+	case NAN_KEY_TYPE_MC_MGMT_RX_KEY:
+		key_mgmt_tlv->mc_rx_idx = (u8)wtbl_entry;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	if (key_op == NAN_KEY_OP_SET_KEY) {
+		key_mgmt_tlv->algorithm_id = key->algo_id;
+		key_mgmt_tlv->key_id = key->key_id;
+		key_mgmt_tlv->key_len = key->key_len;
+
+		if (key_type == NAN_KEY_TYPE_MC_MGMT_RX_KEY && key->pn) {
+			memcpy(key_mgmt_tlv->key_rsc, key->pn,
+			       min_t(size_t, NAN_PACKET_NUMBER_LEN,
+				     sizeof(key_mgmt_tlv->key_rsc)));
+		}
+
+		if (key->key_data) {
+			memcpy(key_mgmt_tlv->key_material, key->key_data,
+			       min_t(size_t, key->key_len,
+				     sizeof(key_mgmt_tlv->key_material)));
+		}
+	}
+
+	return 0;
+}
+
+/**
+ * mt7925_nan_manage_key_cmd - Install/remove a NAN group or pairwise key
+ * @dev: mt792x device pointer
+ * @key_op: NAN_KEY_OP_SET_KEY or NAN_KEY_OP_CLS_KEY
+ * @key_type: which NAN key slot this targets (enum mt7925_nan_key_type)
+ * @wtbl_entry: WTBL index the key is bound to (WTBL_RESERVED_ENTRY invalid)
+ * @local_addr: local MAC address for this key context
+ * @peer_addr: peer MAC address for this key context
+ * @key: key material; key->key_data required for NAN_KEY_OP_SET_KEY
+ *
+ * There are no other callers yet; NAN group key installation added by a
+ * later change calls into this single command path.
+ */
+int
+mt7925_nan_manage_key_cmd(struct mt792x_dev *dev,
+			  enum mt7925_nan_key_operation key_op,
+			  enum mt7925_nan_key_type key_type,
+			  u16 wtbl_entry,
+			  const u8 *local_addr,
+			  const u8 *peer_addr,
+			  const struct mt7925_nan_key_info *key)
+{
+	struct mt76_dev *mdev = &dev->mt76;
+	struct mt7925_nan_common_hdr *hdr = NULL;
+	struct sk_buff *skb = NULL;
+	int ret;
+
+	if (!key || !local_addr || !peer_addr ||
+	    key_type >= NAN_KEY_TYPE_NUM ||
+	    wtbl_entry == WTBL_RESERVED_ENTRY ||
+	    (key_op == NAN_KEY_OP_SET_KEY && !key->key_data))
+		return -EINVAL;
+
+	skb = mt76_mcu_msg_alloc(mdev, NULL,
+				 sizeof(struct mt7925_nan_common_hdr) +
+				 sizeof(struct mt7925_nan_key_mgmt_tlv));
+	if (!skb)
+		return -ENOMEM;
+
+	hdr = (struct mt7925_nan_common_hdr *)skb_put(skb, sizeof(*hdr));
+	memset(hdr, 0, sizeof(*hdr));
+
+	ret = mt7925_nan_key_mgmt_tlv(skb, key_op, key_type, wtbl_entry,
+				      local_addr, peer_addr, key);
+	if (ret) {
+		dev_kfree_skb(skb);
+		return ret;
+	}
+
+	return mt76_mcu_skb_send_msg(mdev, skb, MCU_UNI_CMD(NAN), true);
 }
 
 static int mt7925_nan_avail_ctrl_tlv(struct sk_buff *skb,
@@ -931,14 +1332,14 @@ static int mt7925_nan_peer_cap_tlv(struct sk_buff *skb,
 	return 0;
 }
 
-static void
+static u32
 mt7925_nan_fill_crb_committed(struct mt7925_nan_sched_update_crb_tlv *crb_tlv,
 			      struct ieee80211_nan_peer_sched *sched)
 {
-	u32 m, slot;
+	u32 m, slot, total = 0;
 
 	if (!sched)
-		return;
+		return 0;
 
 	for (m = 0; m < CFG80211_NAN_MAX_PEER_MAPS &&
 	     m < NAN_TIMELINE_MGMT_SIZE; m++) {
@@ -964,10 +1365,14 @@ mt7925_nan_fill_crb_committed(struct mt7925_nan_sched_update_crb_tlv *crb_tlv,
 			if (!ch || !ch->chanctx_conf)
 				continue;
 
+			total++;
+
 			for (dw = 0; dw < NAN_TOTAL_DW; dw++)
 				tl->avail_map[dw] |= cpu_to_le32(BIT(slot));
 		}
 	}
+
+	return total;
 }
 
 static int mt7925_nan_update_crb_tlv(struct sk_buff *skb,
@@ -992,9 +1397,10 @@ static int mt7925_nan_update_crb_tlv(struct sk_buff *skb,
 	crb_tlv->is_use_ranging = false;
 	crb_tlv->comm_ndc_ctrl.is_valid = false;
 
-	mt7925_nan_fill_crb_committed(crb_tlv, sta->nan_sched);
-
-	return 0;
+	/* Returns the number of committed slots programmed; the caller latches
+	 * has_commit only once the command has actually reached firmware.
+	 */
+	return mt7925_nan_fill_crb_committed(crb_tlv, sta->nan_sched);
 }
 
 static int
@@ -1037,6 +1443,7 @@ int mt792x_nan_set_peer_schedule(struct mt792x_dev *dev,
 	struct mt792x_nan *nan;
 	struct mt76_dev *mdev;
 	struct sk_buff *skb;
+	int committed;
 	int ret;
 
 	if (!dev || !sta)
@@ -1075,7 +1482,8 @@ int mt792x_nan_set_peer_schedule(struct mt792x_dev *dev,
 		}
 	}
 
-	if (mt7925_nan_update_crb_tlv(skb, sta, msta)) {
+	committed = mt7925_nan_update_crb_tlv(skb, sta, msta);
+	if (committed < 0) {
 		ret = -ENOMEM;
 		goto free_skb;
 	}
@@ -1088,6 +1496,13 @@ int mt792x_nan_set_peer_schedule(struct mt792x_dev *dev,
 	if (ret && idx_allocated)
 		goto clear_idx;
 
+	/* Latch only now: firmware holds this peer's committed bitmap, so its
+	 * availability gate has slots to open and unencrypted NAF may be
+	 * steered at the peer WTBL. Cleared when the CRB is torn down.
+	 */
+	if (!ret)
+		msta->nan_sched.has_commit = committed > 0;
+
 	return ret;
 
 free_skb:
@@ -1098,6 +1513,7 @@ free_skb:
 clear_idx:
 	clear_bit(msta->nan_sched.sch_idx, &nan->conn_bitmap);
 	msta->nan_sched.idx_assigned = false;
+	msta->nan_sched.has_commit = false;
 
 	return ret;
 }
@@ -1161,6 +1577,7 @@ int mt792x_nan_set_peer_rec(struct mt76_dev *mdev,
 
 	clear_bit(msta->nan_sched.sch_idx, &nan->conn_bitmap);
 	msta->nan_sched.idx_assigned = false;
+	msta->nan_sched.has_commit = false;
 
 	return 0;
 }
@@ -1253,4 +1670,162 @@ clear_ndp_ctx:
 	msta->nan_sched.ndp_ctx_assigned = false;
 
 	return ret ?: -ENOMEM;
+}
+
+/* Allocate a WTBL slot for a lazily-created per-peer NAN group key wcid.
+ * Mirrors mt76_wcid_alloc/init but wires the slot into the RCU wcid table and
+ * clears the hardware admission counter, matching what mt7925_mac_link_sta_add
+ * does for every normal per-link wcid.  Caller must hold dev->mt76.mutex; RCU
+ * publish is the final step so readers always see a fully initialised wcid.
+ */
+int mt7925_nan_wcid_alloc(struct mt792x_dev *dev, struct mt76_wcid *wcid)
+{
+	int idx;
+
+	idx = mt76_wcid_alloc(dev->mt76.wcid_mask, MT792x_WTBL_STA - 1);
+	if (idx < 0)
+		return -ENOSPC;
+
+	wcid->idx = idx;
+	wcid->tx_info |= MT_WCID_TX_INFO_SET;
+	mt76_wcid_init(wcid, 0);
+	mt7925_mac_wtbl_update(dev, idx, MT_WTBL_UPDATE_ADM_COUNT_CLEAR);
+	rcu_assign_pointer(dev->mt76.wcid[idx], wcid);
+
+	return 0;
+}
+
+/* NAN RX IGTK/BIGTK (keyidx 4-7, sta != NULL): lock first, then lazy alloc. */
+static int mt7925_nan_set_rx_igtk(struct mt792x_dev *dev,
+				  const u8 *local_addr, const u8 *peer_addr,
+				  struct mt792x_sta *msta,
+				  enum set_key_cmd cmd,
+				  struct ieee80211_key_conf *key)
+{
+	enum mt7925_nan_key_operation key_op;
+	u16 wtbl_idx;
+	int err;
+
+	mt792x_mutex_acquire(dev);
+
+	/* Lazy allocation of per-peer RX IGTK/BIGTK WTBL: mt76_wcid_alloc()
+	 * touches the shared wcid mask and mt7925_mac_wtbl_update() writes
+	 * hardware registers, so both need dev->mt76.mutex and a woken chip.
+	 */
+	if (msta->nan_rx_igtk_wcid.idx == MT792x_WCID_IDX_UNSET) {
+		if (cmd != SET_KEY) {
+			mt792x_mutex_release(dev);
+			return 0;
+		}
+		err = mt7925_nan_wcid_alloc(dev, &msta->nan_rx_igtk_wcid);
+		if (err) {
+			mt792x_mutex_release(dev);
+			return err;
+		}
+	}
+
+	key_op = (cmd == SET_KEY) ? NAN_KEY_OP_SET_KEY : NAN_KEY_OP_CLS_KEY;
+	wtbl_idx = msta->nan_rx_igtk_wcid.idx;
+
+	err = mt7925_nan_manage_key_cmd(dev, key_op, NAN_KEY_TYPE_MC_MGMT_RX_KEY,
+					wtbl_idx, local_addr, peer_addr,
+					&(struct mt7925_nan_key_info){
+						.algo_id = mt7925_mcu_get_cipher(key->cipher),
+						.key_id  = key->keyidx,
+						.key_len = key->keylen,
+						.key_data = key->key,
+					});
+	mt792x_mutex_release(dev);
+	return err;
+}
+
+/* NAN_DATA GTK (keyidx 1-2): lock first, then lazy alloc for RX; TX unsupported. */
+static int mt7925_nan_set_data_gtk(struct mt792x_dev *dev,
+				   struct ieee80211_sta *sta,
+				   struct mt792x_sta *msta,
+				   enum set_key_cmd cmd,
+				   struct ieee80211_key_conf *key)
+{
+	static const u8 bcast_addr[ETH_ALEN] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+	enum mt7925_nan_key_operation key_op;
+	enum mt7925_nan_key_type key_type;
+	u8 *peer_addr, *local_addr;
+	u16 wtbl_idx;
+	int err;
+
+	mt792x_mutex_acquire(dev);
+
+	key_op = (cmd == SET_KEY) ? NAN_KEY_OP_SET_KEY : NAN_KEY_OP_CLS_KEY;
+
+	if (sta) {
+		/* RX GTK: per-peer dedicated WTBL */
+		peer_addr = sta->addr;
+		local_addr = (u8 *)bcast_addr;
+		key_type = NAN_KEY_TYPE_MC_RX_KEY;
+
+		/* Lazy allocation of per-peer RX GTK WTBL */
+		if (msta->nan_rx_gtk_wcid.idx == MT792x_WCID_IDX_UNSET) {
+			if (key_op != NAN_KEY_OP_SET_KEY) {
+				mt792x_mutex_release(dev);
+				return 0;
+			}
+			err = mt7925_nan_wcid_alloc(dev, &msta->nan_rx_gtk_wcid);
+			if (err) {
+				mt792x_mutex_release(dev);
+				return err;
+			}
+		}
+
+		wtbl_idx = msta->nan_rx_gtk_wcid.idx;
+	} else {
+		/* TX GTK: not supported yet.  Each NAN Data Cluster uses its own
+		 * TX GTK, but mac80211 does not pass an NDC ID at set_key time,
+		 * so the correct key cannot be selected.
+		 */
+		dev_warn(dev->mt76.dev,
+			 "nan: TX GTK not supported (missing NDC ID)\n");
+		mt792x_mutex_release(dev);
+		return -EOPNOTSUPP;
+	}
+
+	err = mt7925_nan_manage_key_cmd(dev, key_op, key_type, wtbl_idx,
+					local_addr, peer_addr,
+					&(struct mt7925_nan_key_info){
+						.algo_id = mt7925_mcu_get_cipher(key->cipher),
+						.key_id  = key->keyidx,
+						.key_len = key->keylen,
+						.key_data = key->key,
+					});
+	mt792x_mutex_release(dev);
+	return err;
+}
+
+int mt7925_nan_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
+		       struct ieee80211_vif *vif, struct ieee80211_sta *sta,
+		       struct ieee80211_key_conf *key)
+{
+	struct mt792x_dev *dev = mt792x_hw_dev(hw);
+	struct mt792x_vif *mvif = (struct mt792x_vif *)vif->drv_priv;
+	struct mt792x_sta *msta = sta ? (struct mt792x_sta *)sta->drv_priv : &mvif->sta;
+
+	if (mt7925_mcu_get_cipher(key->cipher) == CONNAC3_CIPHER_NONE)
+		return -EOPNOTSUPP;
+
+	/* NAN RX IGTK/BIGTK (keyidx 4-7, sta != NULL) */
+	if (vif->type == NL80211_IFTYPE_NAN && sta &&
+	    key->keyidx >= NAN_KEY_IDX_MGMT_INTEG_MIN &&
+	    key->keyidx <= NAN_KEY_IDX_MGMT_INTEG_MAX)
+		return mt7925_nan_set_rx_igtk(dev, vif->addr, sta->addr, msta,
+					      cmd, key);
+
+	/* NAN_DATA GTK (keyidx 1-2) */
+	if (vif->type == NL80211_IFTYPE_NAN_DATA &&
+	    key->keyidx >= NAN_KEY_IDX_GTK_MIN &&
+	    key->keyidx <= NAN_KEY_IDX_GTK_MAX)
+		return mt7925_nan_set_data_gtk(dev, sta, msta, cmd, key);
+
+	/* Unicast keys (NM-TK, ND-TK) and NAN TX IGTK/BIGTK use the normal
+	 * hardware path via set_link_key.
+	 */
+	return -EOPNOTSUPP;
 }

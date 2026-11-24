@@ -178,7 +178,8 @@ int mt7615_mcu_parse_response(struct mt76_dev *mdev, int cmd,
 			return -EMSGSIZE;
 		skb_pull(skb, sizeof(*rxd));
 		event = (struct mt76_connac_mcu_uni_event *)skb->data;
-		ret = le32_to_cpu(event->status);
+		ret = mt76_connac_mcu_status_err(mdev, cmd, seq,
+						 le32_to_cpu(event->status));
 	} else if (cmd == MCU_CE_QUERY(REG_READ)) {
 		struct mt76_connac_mcu_reg_event *event;
 
@@ -795,7 +796,7 @@ mt7615_mcu_wtbl_tx_ba(struct mt7615_dev *dev,
 		return PTR_ERR(wtbl_hdr);
 
 	mt76_connac_mcu_wtbl_ba_tlv(&dev->mt76, skb, params, enable, true,
-				    NULL, wtbl_hdr);
+				    0, NULL, wtbl_hdr);
 
 	err = mt76_mcu_skb_send_msg(&dev->mt76, skb,
 				    MCU_EXT_CMD(WTBL_UPDATE), true);
@@ -843,7 +844,7 @@ mt7615_mcu_wtbl_rx_ba(struct mt7615_dev *dev,
 		return PTR_ERR(wtbl_hdr);
 
 	mt76_connac_mcu_wtbl_ba_tlv(&dev->mt76, skb, params, enable, false,
-				    NULL, wtbl_hdr);
+				    0, NULL, wtbl_hdr);
 
 	return mt76_mcu_skb_send_msg(&dev->mt76, skb,
 				     MCU_EXT_CMD(WTBL_UPDATE), true);
@@ -966,7 +967,7 @@ mt7615_mcu_sta_ba(struct mt7615_dev *dev,
 		return PTR_ERR(wtbl_hdr);
 
 	mt76_connac_mcu_wtbl_ba_tlv(&dev->mt76, skb, params, enable, tx,
-				    sta_wtbl, wtbl_hdr);
+				    0, sta_wtbl, wtbl_hdr);
 
 	return mt76_mcu_skb_send_msg(&dev->mt76, skb,
 				     MCU_EXT_CMD(STA_REC_UPDATE), true);
@@ -1200,7 +1201,7 @@ mt7615_mcu_uni_rx_ba(struct mt7615_dev *dev,
 		return PTR_ERR(wtbl_hdr);
 
 	mt76_connac_mcu_wtbl_ba_tlv(&dev->mt76, skb, params, enable, false,
-				    sta_wtbl, wtbl_hdr);
+				    0, sta_wtbl, wtbl_hdr);
 
 	return mt76_mcu_skb_send_msg(&dev->mt76, skb,
 				     MCU_UNI_CMD(STA_REC_UPDATE), true);
@@ -1241,7 +1242,7 @@ static int mt7615_load_patch(struct mt7615_dev *dev, u32 addr, const char *name)
 {
 	const struct mt7615_patch_hdr *hdr;
 	const struct firmware *fw = NULL;
-	int len, ret, sem;
+	int i, len, ret, sem;
 
 	ret = firmware_request_nowarn(&fw, name, dev->mt76.dev);
 	if (ret)
@@ -1253,7 +1254,17 @@ static int mt7615_load_patch(struct mt7615_dev *dev, u32 addr, const char *name)
 		goto release_fw;
 	}
 
-	sem = mt76_connac_mcu_patch_sem_ctrl(&dev->mt76, true);
+	/*
+	 * On MT7663 the Bluetooth function shares the ROM patch, and the
+	 * semaphore is refused while it downloads the patch: wait for it.
+	 */
+	for (i = 0; i < 50; i++) {
+		sem = mt76_connac_mcu_patch_sem_ctrl(&dev->mt76, true);
+		if (sem != PATCH_NOT_DL_SEM_FAIL)
+			break;
+		msleep(100);
+	}
+
 	switch (sem) {
 	case PATCH_IS_DL:
 		goto release_fw;
@@ -2024,8 +2035,8 @@ static void mt7615_mcu_set_txpower_sku(struct mt7615_phy *phy, u8 *sku)
 	struct mt76_power_limits limits;
 	s8 *limits_array = (s8 *)&limits;
 	int n_chains = hweight8(mphy->antenna_mask);
-	int tx_power = hw->conf.power_level * 2;
 	int i;
+	s8 tx_power;
 	static const u8 sku_mapping[] = {
 #define SKU_FIELD(_type, _field) \
 		[MT_SKU_##_type] = offsetof(struct mt76_power_limits, _field)
@@ -2081,8 +2092,7 @@ static void mt7615_mcu_set_txpower_sku(struct mt7615_phy *phy, u8 *sku)
 #undef SKU_FIELD
 	};
 
-	tx_power = mt76_get_sar_power(mphy, mphy->chandef.chan, tx_power);
-	tx_power -= mt76_tx_power_path_delta(n_chains);
+	tx_power = mt76_get_power_bound(mphy, hw->conf.power_level);
 	tx_power = mt76_get_rate_power_limits(mphy, mphy->chandef.chan,
 					      &limits, tx_power);
 	mphy->txpower_cur = tx_power;

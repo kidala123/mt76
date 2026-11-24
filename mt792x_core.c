@@ -4,6 +4,7 @@
 #include <linux/module.h>
 #include <linux/firmware.h>
 #include <linux/slab.h>
+#include <linux/etherdevice.h>
 
 #include "mt792x.h"
 #include "dma.h"
@@ -117,7 +118,7 @@ static const struct ieee80211_iface_combination if_comb_chanctx_nan[] = {
 		.limits = if_limits_nan_mcc,
 		.n_limits = ARRAY_SIZE(if_limits_nan_mcc),
 		.max_interfaces = MT792x_MAX_INTERFACES,
-		.num_different_channels = 2,
+		.num_different_channels = 3,
 		.beacon_int_infra_match = false,
 	},
 	{
@@ -177,21 +178,50 @@ void mt792x_tx(struct ieee80211_hw *hw, struct ieee80211_tx_control *control,
 	u8 link_id;
 	int qid;
 
+	if (!(info->flags & IEEE80211_TX_CTL_HW_80211_ENCAP) && skb->len >= 2) {
+		struct ieee80211_mgmt *mgmt = (struct ieee80211_mgmt *)skb->data;
+
+		if (vif && ieee80211_vif_type_p2p(vif) == NL80211_IFTYPE_P2P_GO &&
+		    ieee80211_is_probe_resp(mgmt->frame_control) &&
+		    mt792x_vif_is_absent(vif)) {
+			ieee80211_free_txskb(hw, skb);
+			return;
+		}
+	}
+
+	rcu_read_lock();
+
 	if (control->sta) {
 		struct mt792x_link_sta *mlink;
 		struct mt792x_sta *sta;
 		link_id = u32_get_bits(info->control.flags,
 				       IEEE80211_TX_CTRL_MLO_LINK);
 		sta = (struct mt792x_sta *)control->sta->drv_priv;
-		mlink = mt792x_sta_to_link(sta, link_id);
+		if (link_id >= IEEE80211_LINK_UNSPECIFIED)
+			link_id = sta->deflink_id;
+		mlink = mt792x_sta_to_link_rcu(sta, link_id);
+		if (!mlink) {
+			ieee80211_free_txskb(hw, skb);
+			goto unlock;
+		}
 		wcid = &mlink->wcid;
 	}
 
 	if (vif && !control->sta) {
+		struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
+		struct mt792x_bss_conf *mconf;
+		const u8 *da = hdr->addr1;
 		struct mt792x_vif *mvif;
 
 		mvif = (struct mt792x_vif *)vif->drv_priv;
+		mconf = &mvif->bss_conf;
 		wcid = &mvif->sta.deflink.wcid;
+
+		if (info->flags & IEEE80211_TX_CTL_HW_80211_ENCAP)
+			da = skb->data;
+
+		if (mconf->bmc_valid && is_multicast_ether_addr(da))
+			wcid = &mconf->bmc.wcid;
 	}
 
 	if (vif && control->sta && ieee80211_vif_is_mld(vif) &&
@@ -201,7 +231,6 @@ void mt792x_tx(struct ieee80211_hw *hw, struct ieee80211_tx_control *control,
 		struct ieee80211_bss_conf *conf;
 
 		link_id = wcid->link_id;
-		rcu_read_lock();
 		conf = rcu_dereference(vif->link_conf[link_id]);
 		memcpy(hdr->addr2, conf->addr, ETH_ALEN);
 
@@ -210,13 +239,12 @@ void mt792x_tx(struct ieee80211_hw *hw, struct ieee80211_tx_control *control,
 
 		if (vif->type == NL80211_IFTYPE_STATION)
 			memcpy(hdr->addr3, conf->bssid, ETH_ALEN);
-		rcu_read_unlock();
 	}
 
 	if (mt76_connac_pm_ref(mphy, &dev->pm)) {
 		mt76_tx(mphy, control->sta, wcid, skb);
 		mt76_connac_pm_unref(mphy, &dev->pm);
-		return;
+		goto unlock;
 	}
 
 	qid = skb_get_queue_mapping(skb);
@@ -226,6 +254,8 @@ void mt792x_tx(struct ieee80211_hw *hw, struct ieee80211_tx_control *control,
 	}
 
 	mt76_connac_pm_queue_skb(hw, &dev->pm, wcid, skb);
+unlock:
+	rcu_read_unlock();
 }
 EXPORT_SYMBOL_GPL(mt792x_tx);
 
@@ -251,16 +281,12 @@ void mt792x_stop(struct ieee80211_hw *hw, bool suspend)
 }
 EXPORT_SYMBOL_GPL(mt792x_stop);
 
-void mt792x_mac_link_bss_remove(struct mt792x_dev *dev,
-				struct mt792x_bss_conf *mconf,
-				struct mt792x_link_sta *mlink)
+void __mt792x_mac_link_bss_remove(struct mt792x_dev *dev,
+				  struct ieee80211_bss_conf *link_conf,
+				  struct mt792x_bss_conf *mconf,
+				  struct mt792x_link_sta *mlink)
 {
-	struct ieee80211_vif *vif = container_of((void *)mconf->vif,
-						 struct ieee80211_vif, drv_priv);
-	struct ieee80211_bss_conf *link_conf;
 	int idx = mlink->wcid.idx;
-
-	link_conf = mt792x_vif_to_bss_conf(vif, mconf->link_id);
 
 	mt76_connac_free_pending_tx_skbs(&dev->pm, &mlink->wcid);
 	mt76_connac_mcu_uni_add_dev(&dev->mphy, link_conf, &mconf->mt76,
@@ -277,6 +303,19 @@ void mt792x_mac_link_bss_remove(struct mt792x_dev *dev,
 	spin_unlock_bh(&dev->mt76.sta_poll_lock);
 
 	mt76_wcid_cleanup(&dev->mt76, &mlink->wcid);
+}
+EXPORT_SYMBOL_GPL(__mt792x_mac_link_bss_remove);
+
+void mt792x_mac_link_bss_remove(struct mt792x_dev *dev,
+				struct mt792x_bss_conf *mconf,
+				struct mt792x_link_sta *mlink)
+{
+	struct ieee80211_vif *vif = container_of((void *)mconf->vif,
+						 struct ieee80211_vif, drv_priv);
+
+	__mt792x_mac_link_bss_remove(dev,
+				     mt792x_vif_to_bss_conf(vif, mconf->link_id),
+				     mconf, mlink);
 }
 EXPORT_SYMBOL_GPL(mt792x_mac_link_bss_remove);
 
@@ -413,9 +452,25 @@ void mt792x_flush(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 		  u32 queues, bool drop)
 {
 	struct mt792x_dev *dev = mt792x_hw_dev(hw);
+	bool park;
+
+	mt792x_mutex_acquire(dev);
+
+	park = !test_bit(MT76_RESET, &dev->mphy.state);
+	if (park) {
+		mt76_worker_disable(&dev->mt76.tx_worker);
+		if (drop)
+			mt76_txq_purge_pending(&dev->mphy);
+		mt76_txq_schedule_pending(&dev->mphy);
+	}
 
 	wait_event_timeout(dev->mt76.tx_wait,
 			   !mt76_has_tx_pending(&dev->mphy), HZ / 2);
+
+	if (park)
+		mt76_worker_enable(&dev->mt76.tx_worker);
+
+	mt792x_mutex_release(dev);
 }
 EXPORT_SYMBOL_GPL(mt792x_flush);
 
@@ -465,13 +520,11 @@ int mt792x_assign_vif_chanctx(struct ieee80211_hw *hw,
 			      struct ieee80211_bss_conf *link_conf,
 			      struct ieee80211_chanctx_conf *ctx)
 {
-	struct mt792x_chanctx *mctx = (struct mt792x_chanctx *)ctx->drv_priv;
 	struct mt792x_vif *mvif = (struct mt792x_vif *)vif->drv_priv;
 	struct mt792x_dev *dev = mt792x_hw_dev(hw);
 
 	mutex_lock(&dev->mt76.mutex);
 	mvif->bss_conf.mt76.ctx = ctx;
-	mctx->bss_conf = &mvif->bss_conf;
 	mt76_phy_chandef_set(&dev->mphy, &ctx->def);
 	mutex_unlock(&dev->mt76.mutex);
 
@@ -484,12 +537,10 @@ void mt792x_unassign_vif_chanctx(struct ieee80211_hw *hw,
 				 struct ieee80211_bss_conf *link_conf,
 				 struct ieee80211_chanctx_conf *ctx)
 {
-	struct mt792x_chanctx *mctx = (struct mt792x_chanctx *)ctx->drv_priv;
 	struct mt792x_vif *mvif = (struct mt792x_vif *)vif->drv_priv;
 	struct mt792x_dev *dev = mt792x_hw_dev(hw);
 
 	mutex_lock(&dev->mt76.mutex);
-	mctx->bss_conf = NULL;
 	mvif->bss_conf.mt76.ctx = NULL;
 	mutex_unlock(&dev->mt76.mutex);
 
@@ -772,7 +823,6 @@ int mt792x_init_wiphy(struct ieee80211_hw *hw)
 
 	hw->sta_data_size = sizeof(struct mt792x_sta);
 	hw->vif_data_size = sizeof(struct mt792x_vif);
-	hw->chanctx_data_size = sizeof(struct mt792x_chanctx);
 
 	if (dev->fw_features & MT792x_FW_CAP_CNM)
 		wiphy->flags |= WIPHY_FLAG_HAS_REMAIN_ON_CHANNEL;
@@ -806,6 +856,13 @@ int mt792x_init_wiphy(struct ieee80211_hw *hw)
 		wiphy->nan_capa.max_channel_switch_time = 12;
 		wiphy->nan_capa.dev_capabilities = NAN_DEV_CAPA_EXT_KEY_ID_SUPPORTED;
 		wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_SECURE_NAN);
+		wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_BEACON_PROTECTION);
+		wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_BEACON_PROTECTION_CLIENT);
+		/* Per-peer group key WTBL needed for NAN RX IGTK/BIGTK delivery:
+		 * ieee80211_key_enable_hw_accel() drops per-STA group keys unless
+		 * this flag is set or the vif is NAN_DATA.
+		 */
+		ieee80211_hw_set(hw, SUPPORTS_PER_STA_GTK);
 	}
 
 	wiphy->max_scan_ie_len = MT76_CONNAC_SCAN_IE_LEN;
@@ -863,51 +920,65 @@ mt792x_get_offload_capability(struct device *dev, const char *fw_wm)
 {
 	const struct mt76_connac2_fw_trailer *hdr;
 	struct mt792x_realease_info *rel_info;
+	const u8 *data, *end, *fw_end;
 	const struct firmware *fw;
-	int ret, i, offset = 0;
-	const u8 *data, *end;
 	u8 offload_caps = 0;
+	size_t offset;
+	int ret;
 
 	ret = request_firmware(&fw, fw_wm, dev);
 	if (ret)
 		return ret;
 
-	if (!fw || !fw->data || fw->size < sizeof(*hdr)) {
-		dev_err(dev, "Invalid firmware\n");
-		goto out;
-	}
+	if (mt76_connac2_fw_check(fw, &offset))
+		goto invalid;
 
 	data = fw->data;
 	hdr = (const void *)(fw->data + fw->size - sizeof(*hdr));
+	fw_end = (const u8 *)hdr -
+		 hdr->n_region * sizeof(struct mt76_connac2_fw_region);
 
-	for (i = 0; i < hdr->n_region; i++) {
-		const struct mt76_connac2_fw_region *region;
-
-		region = (const void *)((const u8 *)hdr -
-					(hdr->n_region - i) * sizeof(*region));
-		offset += le32_to_cpu(region->len);
-	}
+	if (fw_end - fw->data - offset < 16 + sizeof(*rel_info))
+		goto invalid;
 
 	data += offset + 16;
 	rel_info = (struct mt792x_realease_info *)data;
 	data += sizeof(*rel_info);
+	if (le16_to_cpu(rel_info->len) > fw_end - data)
+		goto invalid;
+
 	end = data + le16_to_cpu(rel_info->len);
 
 	while (data < end) {
+		u16 len;
+
+		if (end - data < sizeof(*rel_info))
+			goto invalid;
+
 		rel_info = (struct mt792x_realease_info *)data;
 		data += sizeof(*rel_info);
+		len = le16_to_cpu(rel_info->len);
+		if (len > end - data || rel_info->pad_len > end - data - len)
+			goto invalid;
 
 		if (rel_info->tag == MT792x_FW_TAG_FEATURE) {
 			struct mt792x_fw_features *features;
+
+			if (len < sizeof(*features))
+				goto invalid;
 
 			features = (struct mt792x_fw_features *)data;
 			offload_caps = features->data;
 			break;
 		}
 
-		data += le16_to_cpu(rel_info->len) + rel_info->pad_len;
+		data += len + rel_info->pad_len;
 	}
 
+	goto out;
+
+invalid:
+	dev_err(dev, "Invalid firmware\n");
 out:
 	release_firmware(fw);
 
@@ -1098,13 +1169,6 @@ EXPORT_SYMBOL_GPL(mt792xe_mcu_fw_pmctrl);
 int mt792x_load_firmware(struct mt792x_dev *dev)
 {
 	int ret;
-
-	mt76_connac_mcu_restart(&dev->mt76);
-
-	if (!mt76_poll_msec(dev, MT_CONN_ON_MISC, MT_TOP_MISC_FW_STATE,
-			    MT_TOP_MISC2_FW_PWR_ON, 1000))
-		dev_warn(dev->mt76.dev,
-			 "MCU is not ready for firmware download\n");
 
 	if (is_mt7928(&dev->mt76)) {
 		dev_info(dev->mt76.dev, "Loading CB firmware patch: %s\n",

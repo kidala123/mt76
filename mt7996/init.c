@@ -376,7 +376,6 @@ static void __mt7996_init_txpower(struct mt7996_phy *phy,
 		target_power = DIV_ROUND_UP(target_power, 2);
 		chan->max_power = min_t(int, chan->max_reg_power,
 					target_power);
-		phy->txpower = max(phy->txpower, chan->max_power);
 		chan->orig_mpwr = target_power;
 	}
 }
@@ -426,6 +425,7 @@ mt7996_init_wiphy_band(struct ieee80211_hw *hw, struct mt7996_phy *phy)
 
 	phy->slottime = 9;
 	phy->beacon_rate = -1;
+	phy->txpower = INT_MIN;
 	phy->rxfilter = MT_WF_RFCR_DROP_OTHER_UC;
 
 	if (phy->mt76->cap.has_2ghz) {
@@ -528,6 +528,10 @@ mt7996_init_wiphy(struct ieee80211_hw *hw, struct mtk_wed_device *wed)
 	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_ACK_SIGNAL_SUPPORT);
 	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_CAN_REPLACE_PTK0);
 	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_MU_MIMO_AIR_SNIFFER);
+	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_SET_SCAN_DWELL);
+	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_PUNCT);
+	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_SCS);
+	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_MSCS);
 
 	if (mt7996_eeprom_has_background_radar(dev) &&
 	    (!mdev->dev->of_node ||
@@ -626,10 +630,6 @@ void mt7996_mac_init(struct mt7996_dev *dev)
 	int i, rx_path_type;
 
 	mt76_clear(dev, MT_MDP_DCR2, MT_MDP_DCR2_RX_TRANS_SHORT);
-
-	for (i = 0; i < mt7996_wtbl_size(dev); i++)
-		mt7996_mac_wtbl_update(dev, i,
-				       MT_WTBL_UPDATE_ADM_COUNT_CLEAR);
 
 	if (IS_ENABLED(CONFIG_MT76_LEDS)) {
 		i = dev->mphy.leds.pin ? MT_LED_GPIO_MUX3 : MT_LED_GPIO_MUX2;
@@ -1280,9 +1280,24 @@ static int mt7996_variant_fem_init(struct mt7996_dev *dev)
 	return 0;
 }
 
+int mt7996_global_wcid_init(struct mt7996_dev *dev)
+{
+	int idx = mt76_wcid_alloc(dev->mt76.wcid_mask, MT7996_WTBL_STA);
+
+	if (idx)
+		return -ENOSPC;
+
+	dev->mt76.global_wcid.idx = idx;
+	dev->mt76.global_wcid.hw_key_idx = -1;
+	dev->mt76.global_wcid.tx_info |= MT_WCID_TX_INFO_SET;
+	rcu_assign_pointer(dev->mt76.wcid[idx], &dev->mt76.global_wcid);
+
+	return 0;
+}
+
 static int mt7996_init_hardware(struct mt7996_dev *dev)
 {
-	int ret, idx;
+	int ret;
 
 	mt76_wr(dev, MT_INT_SOURCE_CSR, ~0);
 	if (is_mt7992(&dev->mt76)) {
@@ -1321,17 +1336,7 @@ static int mt7996_init_hardware(struct mt7996_dev *dev)
 	if (ret < 0)
 		return ret;
 
-	/* Beacon and mgmt frames should occupy wcid 0 */
-	idx = mt76_wcid_alloc(dev->mt76.wcid_mask, MT7996_WTBL_STA);
-	if (idx)
-		return -ENOSPC;
-
-	dev->mt76.global_wcid.idx = idx;
-	dev->mt76.global_wcid.hw_key_idx = -1;
-	dev->mt76.global_wcid.tx_info |= MT_WCID_TX_INFO_SET;
-	rcu_assign_pointer(dev->mt76.wcid[idx], &dev->mt76.global_wcid);
-
-	return 0;
+	return mt7996_global_wcid_init(dev);
 }
 
 void mt7996_set_stream_vht_txbf_caps(struct mt7996_phy *phy)
@@ -1599,6 +1604,7 @@ mt7996_init_eht_caps(struct mt7996_phy *phy, enum nl80211_band band,
 
 	eht_cap_elem->mac_cap_info[0] =
 		IEEE80211_EHT_MAC_CAP0_OM_CONTROL |
+		IEEE80211_EHT_MAC_CAP0_SCS_TRAFFIC_DESC |
 		u8_encode_bits(IEEE80211_EHT_MAC_CAP0_MAX_MPDU_LEN_11454,
 			       IEEE80211_EHT_MAC_CAP0_MAX_MPDU_LEN_MASK);
 

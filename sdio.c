@@ -269,6 +269,9 @@ int mt76s_hw_init(struct mt76_dev *dev, struct sdio_func *func, int hw_ver)
 	case MT76_CONNAC_SDIO:
 		/* set WHISR as read clear and Rx aggregation number as 16 */
 		ctrl = FIELD_PREP(MAX_HIF_RX_LEN_NUM, 16);
+		if (dev->sdio.rx_enhance)
+			ctrl |= RX_ENHANCE_MODE;
+		dev->sdio.intr_pending = false;
 		break;
 	default:
 		ctrl = sdio_readl(func, MCR_WHCR, &ret);
@@ -369,14 +372,20 @@ mt76s_get_next_rx_entry(struct mt76_queue *q)
 	struct mt76_queue_entry *e = NULL;
 
 	spin_lock_bh(&q->lock);
-	if (q->queued > 0) {
+	if (q->queued > 0)
 		e = &q->entry[q->tail];
-		q->tail = (q->tail + 1) % q->ndesc;
-		q->queued--;
-	}
 	spin_unlock_bh(&q->lock);
 
 	return e;
+}
+
+static void
+mt76s_clear_next_rx_entry(struct mt76_queue *q)
+{
+	spin_lock_bh(&q->lock);
+	q->tail = (q->tail + 1) % q->ndesc;
+	q->queued--;
+	spin_unlock_bh(&q->lock);
 }
 
 static int
@@ -397,6 +406,9 @@ mt76s_process_rx_queue(struct mt76_dev *dev, struct mt76_queue *q)
 
 		dev->drv->rx_skb(dev, MT_RXQ_MAIN, e->skb, NULL);
 		e->skb = NULL;
+
+		mt76s_clear_next_rx_entry(q);
+
 		nframes++;
 	}
 	if (qid == MT_RXQ_MAIN)

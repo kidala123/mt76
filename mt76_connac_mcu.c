@@ -1148,8 +1148,8 @@ EXPORT_SYMBOL_GPL(mt76_connac_mcu_sta_cmd);
 
 void mt76_connac_mcu_wtbl_ba_tlv(struct mt76_dev *dev, struct sk_buff *skb,
 				 struct ieee80211_ampdu_params *params,
-				 bool enable, bool tx, void *sta_wtbl,
-				 void *wtbl_tlv)
+				 bool enable, bool tx, u8 band_idx,
+				 void *sta_wtbl, void *wtbl_tlv)
 {
 	struct wtbl_ba *ba;
 	struct tlv *tlv;
@@ -1171,6 +1171,7 @@ void mt76_connac_mcu_wtbl_ba_tlv(struct mt76_dev *dev, struct sk_buff *skb,
 		ba->rst_ba_tid = params->tid;
 		ba->rst_ba_sel = RST_BA_MAC_TID_MATCH;
 		ba->rst_ba_sb = 1;
+		ba->band_idx = band_idx;
 	}
 
 	if (!is_connac_v1(dev)) {
@@ -1240,7 +1241,8 @@ int mt76_connac_mcu_uni_add_dev(struct mt76_phy *phy,
 			.band_idx = mvif->band_idx,
 			.wmm_idx = mvif->wmm_idx,
 			.active = enable,
-			.bmc_tx_wlan_idx = cpu_to_le16(wcid->idx),
+			.bmc_tx_wlan_idx = cpu_to_le16(mvif->bmc_wcid ?:
+						       wcid->idx),
 			.sta_idx = cpu_to_le16(wcid->idx),
 			.conn_state = 1,
 			.link_idx = mvif->link_idx,
@@ -1356,8 +1358,8 @@ int mt76_connac_mcu_sta_ba(struct mt76_dev *dev, struct mt76_vif_link *mvif,
 	if (IS_ERR(wtbl_hdr))
 		return PTR_ERR(wtbl_hdr);
 
-	mt76_connac_mcu_wtbl_ba_tlv(dev, skb, params, enable, tx, sta_wtbl,
-				    wtbl_hdr);
+	mt76_connac_mcu_wtbl_ba_tlv(dev, skb, params, enable, tx,
+				    mvif->band_idx, sta_wtbl, wtbl_hdr);
 
 	ret = mt76_connac_mcu_sta_wed_update(dev, skb);
 	if (ret) {
@@ -1690,7 +1692,7 @@ int mt76_connac_mcu_uni_add_bss(struct mt76_phy *phy,
 	}
 
 	memcpy(basic_req.basic.bssid, vif->bss_conf.bssid, ETH_ALEN);
-	basic_req.basic.bmc_tx_wlan_idx = cpu_to_le16(wcid->idx);
+	basic_req.basic.bmc_tx_wlan_idx = cpu_to_le16(mvif->bmc_wcid ?: wcid->idx);
 	basic_req.basic.sta_idx = cpu_to_le16(wcid->idx);
 	basic_req.basic.conn_state = !enable;
 
@@ -1821,6 +1823,10 @@ int mt76_connac_mcu_hw_scan(struct mt76_phy *phy, struct ieee80211_vif *vif,
 
 	if (test_bit(MT76_HW_SCANNING, &phy->state))
 		return -EBUSY;
+
+	/* max_scan_ie_len does not cover the per-band IEs of all bands */
+	if (sreq->ie_len > sizeof(req->ies))
+		return -EINVAL;
 
 	skb = mt76_mcu_msg_alloc(mdev, NULL, sizeof(*req));
 	if (!skb)
@@ -2171,7 +2177,8 @@ s8 mt76_connac_get_ch_power(struct mt76_phy *phy,
 
 		if (ch->hw_value == chan->hw_value) {
 			if (!(ch->flags & IEEE80211_CHAN_DISABLED)) {
-				int power = 2 * ch->max_reg_power;
+				int power = clamp_t(int, 2 * ch->max_reg_power,
+						    S8_MIN, S8_MAX);
 
 				if (is_mt7663(dev) && (power > 63 || power < -64))
 					power = 63;
@@ -2222,7 +2229,7 @@ mt76_connac_mcu_rate_txpower_band(struct mt76_phy *phy,
 		209, 211, 213, 215, 217, 219, 221,
 		225, 227, 229, 233
 	};
-	int i, n_chan, batch_size, idx = 0, tx_power, last_ch, err = 0;
+	int i, n_chan, batch_size, idx = 0, last_ch, err = 0;
 	struct mt76_connac_sku_tlv sku_tlbv;
 	struct mt76_power_limits *limits;
 	const u8 *ch_list;
@@ -2232,9 +2239,6 @@ mt76_connac_mcu_rate_txpower_band(struct mt76_phy *phy,
 		return -ENOMEM;
 
 	sku_len = is_connac2(dev) ? sizeof(sku_tlbv) : sizeof(sku_tlbv) - 92;
-	tx_power = 2 * phy->hw->conf.power_level;
-	if (!tx_power)
-		tx_power = 127;
 
 	if (band == NL80211_BAND_2GHZ) {
 		n_chan = ARRAY_SIZE(chan_list_2ghz);
@@ -3045,6 +3049,39 @@ s8 mt76_connac_get_rate_power_limit(struct mt76_phy *phy,
 }
 EXPORT_SYMBOL_GPL(mt76_connac_get_rate_power_limit);
 
+int mt76_connac2_fw_check(const struct firmware *fw, size_t *data_len)
+{
+	const struct mt76_connac2_fw_region *region;
+	const struct mt76_connac2_fw_trailer *hdr;
+	size_t avail, len = 0;
+	int i;
+
+	if (!fw || !fw->data || fw->size < sizeof(*hdr))
+		return -EINVAL;
+
+	hdr = (const void *)(fw->data + fw->size - sizeof(*hdr));
+	avail = fw->size - sizeof(*hdr);
+	if (hdr->n_region > avail / sizeof(*region))
+		return -EINVAL;
+
+	avail -= hdr->n_region * sizeof(*region);
+	region = (const void *)(fw->data + avail);
+	for (i = 0; i < hdr->n_region; i++) {
+		u32 region_len = le32_to_cpu(region[i].len);
+
+		if (region_len > avail - len)
+			return -EINVAL;
+
+		len += region_len;
+	}
+
+	if (data_len)
+		*data_len = len;
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(mt76_connac2_fw_check);
+
 static int
 mt76_connac_mcu_send_ram_firmware(struct mt76_dev *dev,
 				  const struct mt76_connac2_fw_trailer *hdr,
@@ -3158,7 +3195,7 @@ int mt76_connac2_load_ram(struct mt76_dev *dev, const char *fw_wm,
 	if (ret)
 		return ret;
 
-	if (!fw || !fw->data || fw->size < sizeof(*hdr)) {
+	if (mt76_connac2_fw_check(fw, NULL)) {
 		dev_err(dev->dev, "Invalid firmware\n");
 		ret = -EINVAL;
 		goto out;
@@ -3187,7 +3224,7 @@ int mt76_connac2_load_ram(struct mt76_dev *dev, const char *fw_wm,
 	if (ret)
 		return ret;
 
-	if (!fw || !fw->data || fw->size < sizeof(*hdr)) {
+	if (mt76_connac2_fw_check(fw, NULL)) {
 		dev_err(dev->dev, "Invalid firmware\n");
 		ret = -EINVAL;
 		goto out;
@@ -3224,7 +3261,7 @@ int mt76_connac3_load_phy_ram(struct mt76_dev *dev, const char *fw_name)
 	if (ret)
 		return ret;
 
-	if (!fw || !fw->data || fw->size < sizeof(*hdr)) {
+	if (mt76_connac2_fw_check(fw, NULL)) {
 		dev_err(dev->dev, "Invalid PHY firmware\n");
 		ret = -EINVAL;
 		goto out;
@@ -3275,6 +3312,33 @@ static u32 mt76_connac2_get_data_mode(struct mt76_dev *dev, u32 info)
 	return mode;
 }
 
+int mt76_connac2_patch_check(const struct firmware *fw)
+{
+	const struct mt76_connac2_patch_hdr *hdr;
+	const struct mt76_connac2_patch_sec *sec;
+	u32 i, n_region;
+
+	if (!fw || !fw->data || fw->size < sizeof(*hdr))
+		return -EINVAL;
+
+	hdr = (const void *)fw->data;
+	n_region = be32_to_cpu(hdr->desc.n_region);
+	if (n_region > (fw->size - sizeof(*hdr)) / sizeof(*sec))
+		return -EINVAL;
+
+	sec = (const void *)(fw->data + sizeof(*hdr));
+	for (i = 0; i < n_region; i++) {
+		u32 offs = be32_to_cpu(sec[i].offs);
+		u32 len = be32_to_cpu(sec[i].info.len);
+
+		if (offs > fw->size || len > fw->size - offs)
+			return -EINVAL;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(mt76_connac2_patch_check);
+
 int mt76_connac2_load_patch(struct mt76_dev *dev, const char *fw_name)
 {
 	int i, ret, sem, max_len = mt76_is_sdio(dev) ? 2048 : 4096;
@@ -3296,7 +3360,7 @@ int mt76_connac2_load_patch(struct mt76_dev *dev, const char *fw_name)
 	if (ret)
 		goto out;
 
-	if (!fw || !fw->data || fw->size < sizeof(*hdr)) {
+	if (mt76_connac2_patch_check(fw)) {
 		dev_err(dev->dev, "Invalid firmware\n");
 		ret = -EINVAL;
 		goto out;

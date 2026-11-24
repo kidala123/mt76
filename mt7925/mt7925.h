@@ -31,6 +31,9 @@
 #define MT7925_SKU_MAX_DELTA_IDX	MT7925_SKU_RATE_NUM
 #define MT7925_SKU_TABLE_SIZE		(MT7925_SKU_RATE_NUM + 1)
 
+/* NAN unicast mgmt TXD MAX_TX_TIME, units of 64 TU: 46 is about 3 s */
+#define NAN_MGMT_MAX_TX_TIME		46
+
 #define MCU_UNI_EVENT_ROC  0x27
 
 #define HIF_TRAFFIC_IDLE 0x2
@@ -60,14 +63,31 @@ enum {
 	UNI_ROC_NUM
 };
 
+/* FW ENUM_CHANNEL_WIDTH_T, which differs from CMD_CBW_* */
+enum mt7925_fw_chan_width {
+	MT7925_CW_20_40MHZ,
+	MT7925_CW_80MHZ,
+	MT7925_CW_160MHZ,
+	MT7925_CW_80P80MHZ,
+	MT7925_CW_5MHZ,
+	MT7925_CW_10MHZ,
+	MT7925_CW_320MHZ,
+};
+
 enum mt7925_roc_req {
 	MT7925_ROC_REQ_JOIN,
 	MT7925_ROC_REQ_ROC,
-	MT7925_ROC_REQ_SUB_LINK,
+	MT7925_ROC_REQ_OFFCHNL_TX = 2,
+	MT7925_ROC_REQ_GO_START_BSS = 3,
+	MT7925_ROC_REQ_DFS_CAC = 4,
 	MT7925_ROC_REQ_MLSR_AG = 10,
 	MT7925_ROC_REQ_MLSR_AA,
 	MT7925_ROC_REQ_NUM
 };
+
+#define MT7925_SAP_CHNL_HOLD_TIME_MS		200
+#define MT7925_P2P_CHNL_HOLD_TIME_MS		3000
+#define MT7925_P2P_GC_JOIN_CH_REQ_INTERVAL_MS	4000
 
 enum {
 	UNI_EVENT_ROC_GRANT = 0,
@@ -313,6 +333,7 @@ int mt7925_mac_sta_event(struct mt76_dev *mdev, struct ieee80211_vif *vif,
 void mt7925_mac_sta_remove(struct mt76_dev *mdev, struct ieee80211_vif *vif,
 			   struct ieee80211_sta *sta);
 void mt7925_mac_reset_work(struct work_struct *work);
+void mt7925_mac_reset_vif_work(struct wiphy *wiphy, struct wiphy_work *work);
 int mt7925e_tx_prepare_skb(struct mt76_dev *mdev, void *txwi_ptr,
 			   enum mt76_txq_id qid, struct mt76_wcid *wcid,
 			   struct ieee80211_sta *sta,
@@ -399,8 +420,7 @@ int mt7925_mcu_set_mlo_roc(struct mt792x_phy *phy, struct mt792x_bss_conf *mconf
 int mt7925_mcu_set_roc(struct mt792x_phy *phy, struct mt792x_bss_conf *mconf,
 		       struct ieee80211_channel *chan, int duration,
 		       enum mt7925_roc_req type, u8 token_id);
-int mt7925_mcu_abort_roc(struct mt792x_phy *phy, struct mt792x_bss_conf *mconf,
-			 u8 token_id);
+int mt7925_mcu_abort_roc(struct mt792x_phy *phy, u8 bss_idx, u8 token_id);
 void mt7925_roc_abort_sync(struct mt792x_dev *dev);
 int mt7925_mcu_fill_message(struct mt76_dev *mdev, struct sk_buff *skb,
 			    int cmd, int *wait_seq);

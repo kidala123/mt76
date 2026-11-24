@@ -501,7 +501,9 @@ void mt792xu_disconnect(struct usb_interface *usb_intf)
 	if (!dev)
 		return;
 
+	mutex_lock(&dev->mt76.mutex);
 	set_bit(MT76_RESET, &dev->mphy.state);
+	mutex_unlock(&dev->mt76.mutex);
 	clear_bit(MT76_STATE_RUNNING, &dev->mphy.state);
 
 	cancel_work_sync(&dev->init_work);
@@ -522,6 +524,8 @@ void mt792xu_disconnect(struct usb_interface *usb_intf)
 	wake_up(&dev->mt76.mcu.wait);
 	skb_queue_purge(&dev->mt76.mcu.res_q);
 	cancel_work_sync(&dev->reset_work);
+	if (!is_connac2(&dev->mt76))
+		mt792x_reset_vif_work_cancel(dev);
 	mt792xu_cleanup(dev);
 	set_bit(MT76_REMOVED, &dev->mphy.state);
 

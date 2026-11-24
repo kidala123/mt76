@@ -6,6 +6,8 @@
 
 #include "mt76_connac.h"
 
+struct firmware;
+
 #define FW_FEATURE_SET_ENCRYPT		BIT(0)
 #define FW_FEATURE_SET_KEY_IDX		GENMASK(2, 1)
 #define FW_FEATURE_ENCRY_MODE		BIT(4)
@@ -1097,8 +1099,10 @@ enum {
 	MCU_UNI_EVENT_PS_SYNC = 0x0d,
 	MCU_UNI_EVENT_SCAN_DONE = 0x0e,
 	MCU_UNI_EVENT_RDD_REPORT = 0x11,
+	MCU_UNI_EVENT_SAP = 0x1c,
 	MCU_UNI_EVENT_ROC = 0x27,
 	MCU_UNI_EVENT_MBMC = 0x28,
+	MCU_UNI_EVENT_BSS_IS_ABSENCE = 0x29,
 	MCU_UNI_EVENT_TX_DONE = 0x2d,
 	MCU_UNI_EVENT_THERMAL = 0x35,
 	MCU_UNI_EVENT_RSSI_MONITOR = 0x41,
@@ -1310,6 +1314,7 @@ enum {
 	MCU_EXT_CMD_GROUP_PRE_CAL_INFO = 0xab,
 	MCU_EXT_CMD_DPD_PRE_CAL_INFO = 0xac,
 	MCU_EXT_CMD_PHY_STAT_INFO = 0xad,
+	MCU_EXT_CMD_SET_QOS_MAP = 0xb4,
 	MCU_EXT_CMD_WF_RF_PIN_CTRL = 0xbd,
 };
 
@@ -1349,6 +1354,7 @@ enum {
 	MCU_UNI_CMD_CHANNEL_SWITCH = 0x34,
 	MCU_UNI_CMD_THERMAL = 0x35,
 	MCU_UNI_CMD_VOW = 0x37,
+	MCU_UNI_CMD_PP = 0x38,
 	MCU_UNI_CMD_FIXED_RATE_TABLE = 0x40,
 	MCU_UNI_CMD_RSSI_MONITOR = 0x41,
 	MCU_UNI_CMD_TESTMODE_CTRL = 0x46,
@@ -1362,6 +1368,7 @@ enum {
 	MCU_UNI_CMD_FACT_CAL = 0x7c,
 	MCU_UNI_CMD_RADIO_STATUS = 0x80,
 	MCU_UNI_CMD_MLD = 0x82,
+	MCU_UNI_CMD_PEER_MLD = 0x83,
 	MCU_UNI_CMD_SDO = 0x88,
 	MCU_UNI_CMD_AXIDMA = 0xa2,
 };
@@ -1957,9 +1964,25 @@ mt76_connac_mcu_get_wlan_idx(struct mt76_dev *dev, struct mt76_wcid *wcid,
 #define MT76_CONNAC_MCU_STATUS_WLAN_FAILURE	0xc0000001
 
 static inline int
+mt76_connac_mcu_status_err(struct mt76_dev *mdev, int cmd, int seq, u32 status)
+{
+	if (!status)
+		return 0;
+
+	if (status == MT76_CONNAC_MCU_STATUS_WLAN_FAILURE)
+		return -ENOLINK;
+
+	dev_warn_ratelimited(mdev->dev,
+			     "Message %08x (seq %d) failed: firmware status 0x%x\n",
+			     cmd, seq, status);
+
+	return -EREMOTEIO;
+}
+
+static inline int
 mt76_connac_mcu_bss_deact_err(struct mt76_dev *mdev, int err, bool enable)
 {
-	if (err != (int)MT76_CONNAC_MCU_STATUS_WLAN_FAILURE)
+	if (err != -ENOLINK)
 		return err;
 
 	/* Ignore wlan_failure state false alarm when deactivating an
@@ -2033,8 +2056,8 @@ void mt76_connac_mcu_wtbl_ht_tlv(struct mt76_dev *dev, struct sk_buff *skb,
 				 void *wtbl_tlv, bool ht_ldpc, bool vht_ldpc);
 void mt76_connac_mcu_wtbl_ba_tlv(struct mt76_dev *dev, struct sk_buff *skb,
 				 struct ieee80211_ampdu_params *params,
-				 bool enable, bool tx, void *sta_wtbl,
-				 void *wtbl_tlv);
+				 bool enable, bool tx, u8 band_idx,
+				 void *sta_wtbl, void *wtbl_tlv);
 void mt76_connac_mcu_sta_ba_tlv(struct sk_buff *skb,
 				struct ieee80211_ampdu_params *params,
 				bool enable, bool tx);
@@ -2149,9 +2172,11 @@ int mt76_connac_mcu_del_wtbl_all(struct mt76_dev *dev);
 int mt76_connac_mcu_rdd_cmd(struct mt76_dev *dev, int cmd, u8 index,
 			    u8 rx_sel, u8 val);
 int mt76_connac_mcu_sta_wed_update(struct mt76_dev *dev, struct sk_buff *skb);
+int mt76_connac2_fw_check(const struct firmware *fw, size_t *data_len);
 int mt76_connac2_load_ram(struct mt76_dev *dev, const char *fw_wm,
 			  const char *fw_wa);
 int mt76_connac3_load_phy_ram(struct mt76_dev *dev, const char *fw_name);
+int mt76_connac2_patch_check(const struct firmware *fw);
 int mt76_connac2_load_patch(struct mt76_dev *dev, const char *fw_name);
 int mt76_connac3_load_cb_patch(struct mt76_dev *dev, const char *fw_name);
 int mt76_connac2_mcu_fill_message(struct mt76_dev *mdev, struct sk_buff *skb,

@@ -5,6 +5,7 @@
 #include <linux/etherdevice.h>
 #include <linux/timekeeping.h>
 #include "mt7925.h"
+#include "p2p.h"
 #include "../dma.h"
 #include "regd.h"
 #include "mac.h"
@@ -53,12 +54,14 @@ static void mt7925_mac_sta_poll(struct mt792x_dev *dev)
 		u16 idx;
 		u8 bw;
 
-		if (list_empty(&sta_poll_list))
+		spin_lock_bh(&dev->mt76.sta_poll_lock);
+		if (list_empty(&sta_poll_list)) {
+			spin_unlock_bh(&dev->mt76.sta_poll_lock);
 			break;
+		}
 		mlink = list_first_entry(&sta_poll_list,
 					 struct mt792x_link_sta, wcid.poll_list);
 		msta = mlink->sta;
-		spin_lock_bh(&dev->mt76.sta_poll_lock);
 		list_del_init(&mlink->wcid.poll_list);
 		spin_unlock_bh(&dev->mt76.sta_poll_lock);
 
@@ -87,7 +90,7 @@ static void mt7925_mac_sta_poll(struct mt792x_dev *dev)
 			memset(mlink->airtime_ac, 0, sizeof(mlink->airtime_ac));
 		}
 
-		if (!mlink->wcid.sta)
+		if (!msta || !mlink->wcid.sta)
 			continue;
 
 		sta = container_of((void *)msta, struct ieee80211_sta,
@@ -167,10 +170,29 @@ void mt7925_mac_set_fixed_rate_table(struct mt792x_dev *dev,
 	u32 ctrl = MT_WTBL_ITCR_WR | MT_WTBL_ITCR_EXEC | tbl_idx;
 
 	if (is_mt7928(&dev->mt76)) {
-		mt76_wr(dev, MT7928_WTBL_ITDR0, rate_idx);
+		/* MT7928 drops host writes to the WTBLON CRs (reads still
+		 * work), so program the table through MCU REG_ACCESS.
+		 */
+		u32 spe = MT_WTBL_SPE_IDX_SEL;
+		u32 rate = rate_idx;
+		int ret;
+
+		ret = mt7925_mcu_regval(dev, MT7928_WTBL_ITDR0, &rate, true);
+		if (ret)
+			goto out;
 		/* use wtbl spe idx */
-		mt76_wr(dev, MT7928_WTBL_ITDR1, MT_WTBL_SPE_IDX_SEL);
-		mt76_wr(dev, MT7928_WTBL_ITCR, ctrl);
+		ret = mt7925_mcu_regval(dev, MT7928_WTBL_ITDR1, &spe, true);
+		if (ret)
+			goto out;
+		ret = mt7925_mcu_regval(dev, MT7928_WTBL_ITCR, &ctrl, true);
+		if (ret)
+			goto out;
+
+		return;
+out:
+		dev_err(dev->mt76.dev,
+			"failed to set fixed rate table idx %u: %d\n",
+			tbl_idx, ret);
 	} else {
 		mt76_wr(dev, MT_WTBL_ITDR0, rate_idx);
 		/* use wtbl spe idx */
@@ -184,9 +206,11 @@ static int mt7925_reverse_frag0_hdr_trans(struct sk_buff *skb, u16 hdr_gap)
 {
 	struct mt76_rx_status *status = (struct mt76_rx_status *)skb->cb;
 	struct ethhdr *eth_hdr = (struct ethhdr *)(skb->data + hdr_gap);
-	struct mt792x_sta *msta = (struct mt792x_sta *)status->wcid;
+	struct ieee80211_bss_conf *link_conf;
+	struct mt792x_link_sta *mlink;
 	__le32 *rxd = (__le32 *)skb->data;
 	struct ieee80211_sta *sta;
+	struct mt792x_sta *msta;
 	struct ieee80211_vif *vif;
 	struct ieee80211_hdr hdr;
 	u16 frame_control;
@@ -198,11 +222,20 @@ static int mt7925_reverse_frag0_hdr_trans(struct sk_buff *skb, u16 hdr_gap)
 	if (!(le32_to_cpu(rxd[1]) & MT_RXD1_NORMAL_GROUP_4))
 		return -EINVAL;
 
+	/* not every WTBL entry is a station link, e.g. the global wcid */
+	if (!status->wcid || !status->wcid->sta)
+		return -EINVAL;
+
+	mlink = container_of(status->wcid, struct mt792x_link_sta, wcid);
+	msta = mlink->sta;
 	if (!msta || !msta->vif)
 		return -EINVAL;
 
-	sta = container_of((void *)msta, struct ieee80211_sta, drv_priv);
+	sta = wcid_to_sta(status->wcid);
 	vif = container_of((void *)msta->vif, struct ieee80211_vif, drv_priv);
+	link_conf = rcu_dereference(vif->link_conf[mlink->wcid.link_id]);
+	if (!link_conf)
+		return -EINVAL;
 
 	/* store the info from RXD and ethhdr to avoid being overridden */
 	frame_control = le32_get_bits(rxd[8], MT_RXD8_FRAME_CONTROL);
@@ -215,7 +248,7 @@ static int mt7925_reverse_frag0_hdr_trans(struct sk_buff *skb, u16 hdr_gap)
 	switch (frame_control & (IEEE80211_FCTL_TODS |
 				 IEEE80211_FCTL_FROMDS)) {
 	case 0:
-		ether_addr_copy(hdr.addr3, vif->bss_conf.bssid);
+		ether_addr_copy(hdr.addr3, link_conf->bssid);
 		break;
 	case IEEE80211_FCTL_FROMDS:
 		ether_addr_copy(hdr.addr3, eth_hdr->h_source);
@@ -390,6 +423,7 @@ mt7925_mac_fill_rx(struct mt792x_dev *dev, struct sk_buff *skb)
 	u8 mode = 0; /* , band_idx; */
 	u16 seq_ctrl = 0;
 	__le16 fc = 0;
+	u8 sec_mode;
 	int idx;
 
 	memset(status, 0, sizeof(*status));
@@ -445,7 +479,9 @@ mt7925_mac_fill_rx(struct mt792x_dev *dev, struct sk_buff *skb)
 	if (rxd1 & MT_RXD1_NORMAL_TKIP_MIC_ERR)
 		status->flag |= RX_FLAG_MMIC_ERROR;
 
-	if (FIELD_GET(MT_RXD2_NORMAL_SEC_MODE, rxd2) != 0 &&
+	/* a BIP frame keeps its MME, for mac80211 to check MIC and IPN */
+	sec_mode = FIELD_GET(MT_RXD2_NORMAL_SEC_MODE, rxd2);
+	if (sec_mode != 0 && sec_mode != MT_CIPHER_BIP_CMAC_128 &&
 	    !(rxd1 & (MT_RXD1_NORMAL_CLM | MT_RXD1_NORMAL_CM))) {
 		status->flag |= RX_FLAG_DECRYPTED;
 		status->flag |= RX_FLAG_IV_STRIPPED;
@@ -476,7 +512,7 @@ mt7925_mac_fill_rx(struct mt792x_dev *dev, struct sk_buff *skb)
 		u8 *data = (u8 *)rxd;
 
 		if (status->flag & RX_FLAG_DECRYPTED) {
-			switch (FIELD_GET(MT_RXD2_NORMAL_SEC_MODE, rxd2)) {
+			switch (sec_mode) {
 			case MT_CIPHER_AES_CCMP:
 			case MT_CIPHER_CCMP_CCX:
 			case MT_CIPHER_CCMP_256:
@@ -650,7 +686,7 @@ mt7925_mac_write_txwi_8023(__le32 *txwi, struct sk_buff *skb,
 	if (wcid->sta) {
 		struct ieee80211_sta *sta;
 
-		sta = container_of((void *)wcid, struct ieee80211_sta, drv_priv);
+		sta = wcid_to_sta(wcid);
 		wmm = sta->wme;
 	}
 
@@ -743,6 +779,16 @@ mt7925_mac_write_txwi_80211(struct mt76_dev *dev, __le32 *txwi,
 	}
 }
 
+static bool
+mt7925_mac_deauth_on_ac(struct ieee80211_vif *vif, struct sk_buff *skb)
+{
+	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
+
+	return vif && vif->type == NL80211_IFTYPE_STATION &&
+	       ieee80211_vif_is_mld(vif) && vif->cfg.assoc &&
+	       ieee80211_is_deauth(hdr->frame_control);
+}
+
 void
 mt7925_mac_write_txwi(struct mt76_dev *dev, __le32 *txwi,
 		      struct sk_buff *skb, struct mt76_wcid *wcid,
@@ -761,8 +807,8 @@ mt7925_mac_write_txwi(struct mt76_dev *dev, __le32 *txwi,
 					 BSS_CHANGED_FILS_DISCOVERY));
 	struct mt792x_bss_conf *mconf;
 
-	mconf = vif ? mt792x_vif_to_link((struct mt792x_vif *)vif->drv_priv,
-					 wcid->link_id) : NULL;
+	mconf = vif ? mt792x_vif_to_link_rcu((struct mt792x_vif *)vif->drv_priv,
+					     wcid->link_id) : NULL;
 	mvif = mconf ? (struct mt76_vif_link *)&mconf->mt76 : NULL;
 
 	if (mvif) {
@@ -777,7 +823,7 @@ mt7925_mac_write_txwi(struct mt76_dev *dev, __le32 *txwi,
 	} else if (beacon) {
 		p_fmt = MT_TX_TYPE_FW;
 		q_idx = MT_LMAC_BCN0;
-	} else if (qid >= MT_TXQ_PSD) {
+	} else if (qid >= MT_TXQ_PSD && !mt7925_mac_deauth_on_ac(vif, skb)) {
 		p_fmt = mt76_is_mmio(dev) ? MT_TX_TYPE_CT : MT_TX_TYPE_SF;
 		q_idx = MT_LMAC_ALTX0;
 	} else {
@@ -806,6 +852,29 @@ mt7925_mac_write_txwi(struct mt76_dev *dev, __le32 *txwi,
 	txwi[2] = 0;
 
 	val = FIELD_PREP(MT_TXD3_REM_TX_COUNT, 15);
+
+	/* NAN setup handshakes are one-shot at the host: a single lost burst
+	 * kills the NDP (peers transmit at each other nearly simultaneously
+	 * after M3 and half-duplex radios miss the reply). Double the retry
+	 * budget so the burst outlives the cross-fire window.
+	 */
+	if (vif && vif->type == NL80211_IFTYPE_NAN) {
+		struct ieee80211_hdr *nan_hdr = (struct ieee80211_hdr *)skb->data;
+
+		if (ieee80211_is_mgmt(nan_hdr->frame_control) &&
+		    !is_multicast_ether_addr(nan_hdr->addr1)) {
+			val = FIELD_PREP(MT_TXD3_REM_TX_COUNT, 31);
+
+			/* The retry budget alone never finalises a frame whose
+			 * peer has gone: the DW-WTBL gate re-arms it every DW,
+			 * so firmware holds the frame indefinitely and the host
+			 * never gets a TX status. Bound it in time instead -
+			 * about six DWs, beyond the 2 s handshake deadline.
+			 */
+			txwi[2] |= cpu_to_le32(FIELD_PREP(MT_TXD2_MAX_TX_TIME,
+							  NAN_MGMT_MAX_TX_TIME));
+		}
+	}
 
 	if (key)
 		val |= MT_TXD3_PROTECT_FRAME;
@@ -864,6 +933,8 @@ mt7925_mac_write_txwi(struct mt76_dev *dev, __le32 *txwi,
 
 		txwi[3] |= cpu_to_le32(MT_TXD3_BA_DISABLE);
 	}
+
+	mt7925_p2p_txwi_override(dev, txwi, skb);
 }
 EXPORT_SYMBOL_GPL(mt7925_mac_write_txwi);
 
@@ -1459,6 +1530,15 @@ void mt7925_queue_rx_skb(struct mt76_dev *mdev, enum mt76_rxq_id q,
 	case PKT_TYPE_NORMAL_MCU:
 	case PKT_TYPE_NORMAL:
 		if (!mt7925_mac_fill_rx(dev, skb)) {
+			struct mt76_rx_status *status =
+				(struct mt76_rx_status *)skb->cb;
+
+			if (!(status->flag & RX_FLAG_8023) &&
+			    mt7925_p2p_rx_drop_chan_mismatch(dev, skb)) {
+				dev_kfree_skb(skb);
+				return;
+			}
+
 			mt76_rx(&dev->mt76, q, skb);
 			return;
 		}
@@ -1492,6 +1572,7 @@ mt7925_vif_connect_iter(void *priv, u8 *mac,
 			continue;
 
 		mconf = mt792x_vif_to_link(mvif, i);
+		mconf->absent = false;
 
 		mt76_connac_mcu_uni_add_dev(&dev->mphy, bss_conf, &mconf->mt76,
 					    &mvif->sta.deflink.wcid, true);
@@ -1562,10 +1643,22 @@ out:
 		return;
 
 	ieee80211_wake_queues(hw);
-	ieee80211_iterate_active_interfaces(hw,
-					    IEEE80211_IFACE_ITER_RESUME_ALL,
-					    mt7925_vif_connect_iter, NULL);
-	mt76_connac_power_save_sched(&dev->mt76.phy, pm);
+	wiphy_work_queue(hw->wiphy, &dev->reset_vif_work);
+}
+
+void mt7925_mac_reset_vif_work(struct wiphy *wiphy, struct wiphy_work *work)
+{
+	struct mt792x_dev *dev = container_of(work, struct mt792x_dev,
+					      reset_vif_work);
+
+	if (test_bit(MT76_REMOVED, &dev->mphy.state))
+		return;
+
+	mt792x_mutex_acquire(dev);
+	ieee80211_iterate_active_interfaces_mtx(mt76_hw(dev),
+						IEEE80211_IFACE_ITER_RESUME_ALL,
+						mt7925_vif_connect_iter, NULL);
+	mt792x_mutex_release(dev);
 
 	mt7925_regd_change(&dev->phy, "00");
 }

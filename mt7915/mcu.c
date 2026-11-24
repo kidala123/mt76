@@ -174,6 +174,11 @@ mt7915_mcu_parse_response(struct mt76_dev *mdev, int cmd,
 
 		return -ETIMEDOUT;
 	}
+	if (cmd == MCU_CMD(PATCH_SEM_CONTROL) &&
+	    skb->len < sizeof(*rxd) - 4 + sizeof(u8))
+		return -EINVAL;
+	if (cmd != MCU_CMD(PATCH_SEM_CONTROL) && skb->len < sizeof(*rxd))
+		return -EINVAL;
 
 	rxd = (struct mt76_connac2_mcu_rxd *)skb->data;
 	if (seq != rxd->seq &&
@@ -185,6 +190,9 @@ mt7915_mcu_parse_response(struct mt76_dev *mdev, int cmd,
 		skb_pull(skb, sizeof(*rxd) - 4);
 		ret = *skb->data;
 	} else if (cmd == MCU_EXT_CMD(THERMAL_CTRL)) {
+		if (skb->len < sizeof(*rxd) + 4 + sizeof(__le32))
+			return -EINVAL;
+
 		skb_pull(skb, sizeof(*rxd) + 4);
 		ret = le32_to_cpu(*(__le32 *)skb->data);
 	} else {
@@ -206,8 +214,6 @@ mt7915_mcu_set_timeout(struct mt76_dev *mdev, int cmd)
 	case MCU_EXT_CMD_THERMAL_CTRL:
 	case MCU_EXT_CMD_GET_MIB_INFO:
 	case MCU_EXT_CMD_PHY_STAT_INFO:
-	case MCU_EXT_CMD_STA_REC_UPDATE:
-	case MCU_EXT_CMD_BSS_INFO_UPDATE:
 		mdev->mcu.timeout = 2 * HZ;
 		return;
 	case MCU_EXT_CMD_EFUSE_BUFFER_MODE:
@@ -405,16 +411,32 @@ mt7915_mcu_rx_bcc_notify(struct mt7915_dev *dev, struct sk_buff *skb)
 static void
 mt7915_mcu_rx_ps_sync(struct mt7915_dev *dev, struct sk_buff *skb)
 {
+	struct mt7915_mcu_ps_notify_v2 *p2 = (void *)skb->data;
 	struct mt7915_mcu_ps_notify *p = (void *)skb->data;
 	struct mt76_wcid *wcid;
 	u16 wcid_idx;
+	bool v2, ps;
 
-	wcid_idx = p->wtbl_lower | (p->wtbl_higher << 8);
+	/* the mt7986 and mt7981 firmware send the longer v2 layout */
+	v2 = le16_to_cpu(p->rxd.len) >=
+	     sizeof(*p2) - offsetof(struct mt76_connac2_mcu_rxd_hdr, len);
+	if (skb->len < (v2 ? sizeof(*p2) : sizeof(*p)))
+		return;
+
+	if (v2) {
+		wcid_idx = le16_to_cpu(p2->wtbl_lower) |
+			   (le16_to_cpu(p2->wtbl_higher) << 8);
+		ps = p2->ps_bit;
+	} else {
+		wcid_idx = p->wtbl_lower | (p->wtbl_higher << 8);
+		ps = p->ps_bit;
+	}
+
 	wcid = mt76_wcid_ptr(dev, wcid_idx);
 	if (!wcid || !wcid_to_sta(wcid))
 		return;
 
-	mt76_sta_ps_transition(&dev->mt76, wcid, !!p->ps_bit);
+	mt76_sta_ps_transition(&dev->mt76, wcid, ps);
 }
 
 static void
@@ -2222,6 +2244,65 @@ int mt7915_mcu_fw_dbg_ctrl(struct mt7915_dev *dev, u32 module, u8 level)
 				 sizeof(data), false);
 }
 
+int mt7915_mcu_fw_debug_set(struct mt7915_dev *dev, u8 type, bool load)
+{
+	enum {
+		DEBUG_TXCMD = 62,
+		DEBUG_CMD_RPT_TX,
+		DEBUG_CMD_RPT_TRIG,
+		DEBUG_SPL,
+		DEBUG_RPT_RX,
+	} debug;
+	bool tx, rx, en;
+	u8 ctrl;
+	int ret;
+
+	if (type == MCU_FW_LOG_WA) {
+		ret = mt7915_mcu_fw_log_2_host(dev, MCU_FW_LOG_WA,
+					       dev->fw.debug_wa);
+		if (ret || (load && !dev->fw.debug_wa))
+			return ret;
+
+		return mt7915_mcu_wa_cmd(dev, MCU_WA_PARAM_CMD(SET),
+					 MCU_WA_PARAM_PDMA_RX,
+					 !!dev->fw.debug_wa, 0);
+	}
+
+	if (dev->fw.debug_bin)
+		ctrl = 16;
+	else
+		ctrl = dev->fw.debug_wm;
+
+	tx = dev->fw.debug_wm || (dev->fw.debug_bin & BIT(1));
+	rx = dev->fw.debug_wm || (dev->fw.debug_bin & BIT(2));
+	en = dev->fw.debug_wm || (dev->fw.debug_bin & BIT(0));
+
+	ret = mt7915_mcu_fw_log_2_host(dev, MCU_FW_LOG_WM, ctrl);
+	if (ret || (load && !en))
+		return ret;
+
+	for (debug = DEBUG_TXCMD; debug <= DEBUG_RPT_RX; debug++) {
+		u8 level;
+
+		if (debug == DEBUG_RPT_RX)
+			level = en && rx;
+		else
+			level = en && tx;
+
+		ret = mt7915_mcu_fw_dbg_ctrl(dev, debug, level);
+		if (ret)
+			return ret;
+	}
+
+	mt76_clear(dev, MT_CPU_UTIL_CTRL, BIT(0));
+	mt76_wr(dev, MT_DIC_CMD_REG_CMD, BIT(2) | BIT(13) |
+		(dev->fw.debug_wm ? 0 : BIT(0)));
+	mt76_wr(dev, MT_MCU_WM_CIRQ_IRQ_MASK_CLR_ADDR, BIT(5));
+	mt76_wr(dev, MT_MCU_WM_CIRQ_IRQ_SOFT_ADDR, BIT(5));
+
+	return 0;
+}
+
 int mt7915_mcu_muru_debug_set(struct mt7915_dev *dev, bool enabled)
 {
 	struct {
@@ -2255,6 +2336,10 @@ int mt7915_mcu_muru_debug_get(struct mt7915_phy *phy)
 					&req, sizeof(req), true, &skb);
 	if (ret)
 		return ret;
+	if (skb->len < sizeof(*mu_stats)) {
+		dev_kfree_skb(skb);
+		return -EINVAL;
+	}
 
 	mu_stats = (struct mt7915_mcu_muru_stats *)(skb->data);
 
@@ -2438,11 +2523,11 @@ int mt7915_mcu_init_firmware(struct mt7915_dev *dev)
 		return ret;
 
 	set_bit(MT76_STATE_MCU_RUNNING, &dev->mphy.state);
-	ret = mt7915_mcu_fw_log_2_host(dev, MCU_FW_LOG_WM, 0);
+	ret = mt7915_mcu_fw_debug_set(dev, MCU_FW_LOG_WM, true);
 	if (ret)
 		return ret;
 
-	ret = mt7915_mcu_fw_log_2_host(dev, MCU_FW_LOG_WA, 0);
+	ret = mt7915_mcu_fw_debug_set(dev, MCU_FW_LOG_WA, true);
 	if (ret)
 		return ret;
 
@@ -2951,8 +3036,17 @@ int mt7915_mcu_get_eeprom(struct mt7915_dev *dev, u32 offset, u8 *read_buf)
 					&req, sizeof(req), true, &skb);
 	if (ret)
 		return ret;
+	if (skb->len < sizeof(*res)) {
+		dev_kfree_skb(skb);
+		return -EINVAL;
+	}
 
 	res = (struct mt7915_mcu_eeprom_info *)skb->data;
+	if (!le32_to_cpu(res->valid)) {
+		dev_kfree_skb(skb);
+		return -ENODATA;
+	}
+
 	if (!buf) {
 		u32 addr = le32_to_cpu(res->addr);
 
@@ -2987,6 +3081,10 @@ int mt7915_mcu_get_eeprom_free_block(struct mt7915_dev *dev, u8 *block_num)
 					&req, sizeof(req), true, &skb);
 	if (ret)
 		return ret;
+	if (skb->len < sizeof(*block_num)) {
+		dev_kfree_skb(skb);
+		return -EINVAL;
+	}
 
 	*block_num = *(u8 *)skb->data;
 	dev_kfree_skb(skb);
@@ -3024,33 +3122,35 @@ static int mt7915_mcu_set_pre_cal(struct mt7915_dev *dev, u8 idx,
 
 int mt7915_mcu_apply_group_cal(struct mt7915_dev *dev)
 {
-	u8 idx = 0, *cal = dev->cal, *eep = dev->mt76.eeprom.data;
-	u32 total = mt7915_get_cal_group_size(dev);
+	u8 idx, units, *cal = dev->cal, *eep = dev->mt76.eeprom.data;
+	u32 size = mt7915_get_cal_group_size(dev);
 	u32 offs = is_mt7915(&dev->mt76) ? MT_EE_DO_PRE_CAL : MT_EE_DO_PRE_CAL_V2;
+	u32 trailer = size % MT_EE_CAL_UNIT;
+	int ret;
 
 	if (!(eep[offs] & MT_EE_WIFI_CAL_GROUP))
 		return 0;
+
+	units = size / MT_EE_CAL_UNIT;
+	if (is_mt7981(&dev->mt76))
+		units = MT_EE_CAL_GROUP_FW_UNITS_7981;
 
 	/*
 	 * Items: Rx DCOC, RSSI DCOC, Tx TSSI DCOC, Tx LPFG
 	 * Tx FDIQ, Tx DCIQ, Rx FDIQ, Rx FIIQ, ADCDCOC
 	 */
-	while (total > 0) {
-		int ret, len;
-
-		len = min_t(u32, total, MT_EE_CAL_UNIT);
-
-		ret = mt7915_mcu_set_pre_cal(dev, idx, cal, len,
+	for (idx = 0; idx < units; idx++) {
+		ret = mt7915_mcu_set_pre_cal(dev, idx,
+					     cal + idx * MT_EE_CAL_UNIT,
+					     MT_EE_CAL_UNIT,
 					     MCU_EXT_CMD(GROUP_PRE_CAL_INFO));
 		if (ret)
 			return ret;
-
-		total -= len;
-		cal += len;
-		idx++;
 	}
 
-	return 0;
+	/* the trailer follows all units of the flash layout */
+	return mt7915_mcu_set_pre_cal(dev, idx, cal + size - trailer, trailer,
+				      MCU_EXT_CMD(GROUP_PRE_CAL_INFO));
 }
 
 static int mt7915_find_freq_idx(const u16 *freqs, int n_freqs, u16 cur)
@@ -3237,6 +3337,10 @@ int mt7915_mcu_get_chan_mib_info(struct mt7915_phy *phy, bool chan_switch)
 					req, len * sizeof(req[0]), true, &skb);
 	if (ret)
 		return ret;
+	if (skb->len < offs_cc + len * sizeof(*res)) {
+		dev_kfree_skb(skb);
+		return -EINVAL;
+	}
 
 	res = (struct mt7915_mcu_mib *)(skb->data + offs_cc);
 
@@ -4056,6 +4160,10 @@ int mt7915_mcu_get_rx_rate(struct mt7915_phy *phy, struct ieee80211_vif *vif,
 					&req, sizeof(req), true, &skb);
 	if (ret)
 		return ret;
+	if (skb->len < sizeof(*res)) {
+		dev_kfree_skb(skb);
+		return -EINVAL;
+	}
 
 	res = (struct mt7915_mcu_phy_rx_info *)skb->data;
 
@@ -4293,7 +4401,7 @@ int mt7915_mcu_wed_wa_tx_stats(struct mt7915_dev *dev, u16 wlan_idx)
 	} __packed *res;
 	struct mt76_wcid *wcid;
 	struct sk_buff *skb;
-	int ret, len;
+	int ret, len, offset;
 	u16 ret_wcid;
 
 	if (is_mt7915(&dev->mt76)) {
@@ -4310,8 +4418,13 @@ int mt7915_mcu_wed_wa_tx_stats(struct mt7915_dev *dev, u16 wlan_idx)
 	if (ret)
 		return ret;
 
-	if (!is_mt7915(&dev->mt76))
-		skb_pull(skb, 4);
+	offset = is_mt7915(&dev->mt76) ? 0 : 4;
+	if (skb->len < offset + sizeof(*res)) {
+		dev_kfree_skb(skb);
+		return -EINVAL;
+	}
+
+	skb_pull(skb, offset);
 
 	res = (struct mt7915_mcu_wa_tx_stat *)skb->data;
 
@@ -4361,6 +4474,10 @@ int mt7915_mcu_rf_regval(struct mt7915_dev *dev, u32 regidx, u32 *val, bool set)
 					&req, sizeof(req), true, &skb);
 	if (ret)
 		return ret;
+	if (skb->len < 8 + sizeof(__le32)) {
+		dev_kfree_skb(skb);
+		return -EINVAL;
+	}
 
 	*val = le32_to_cpu(*(__le32 *)(skb->data + 8));
 	dev_kfree_skb(skb);

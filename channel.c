@@ -29,6 +29,16 @@ mt76_phy_update_channel(struct mt76_phy *phy,
 	return __mt76_set_channel(phy, &phy->main_chandef, false);
 }
 
+static void mt76_phy_mac_work_restart(struct mt76_phy *phy)
+{
+	struct mt76_dev *dev = phy->dev;
+
+	if (test_bit(MT76_STATE_RUNNING, &phy->state) &&
+	    !test_bit(MT76_MCU_RESET, &dev->phy.state) &&
+	    !test_bit(MT76_RESTART, &dev->phy.state))
+		ieee80211_queue_delayed_work(phy->hw, &phy->mac_work, 0);
+}
+
 int mt76_add_chanctx(struct ieee80211_hw *hw,
 		     struct ieee80211_chanctx_conf *conf)
 {
@@ -85,8 +95,12 @@ void mt76_change_chanctx(struct ieee80211_hw *hw,
 	struct mt76_dev *dev = phy->dev;
 
 	if (!(changed & (IEEE80211_CHANCTX_CHANGE_WIDTH |
-			 IEEE80211_CHANCTX_CHANGE_RADAR)))
+			 IEEE80211_CHANCTX_CHANGE_RADAR |
+			 IEEE80211_CHANCTX_CHANGE_PUNCTURING)))
 		return;
+
+	if (mt76_phy_scanning(phy))
+		mt76_abort_scan(dev);
 
 	if (phy->roc_vif)
 		mt76_abort_roc(phy);
@@ -133,7 +147,7 @@ int mt76_assign_vif_chanctx(struct ieee80211_hw *hw,
 		mlink_alloc = true;
 	}
 
-	mlink->ctx = conf;
+	mt76_vif_link_ctx_set(mlink, conf);
 	ret = dev->drv->vif_link_add(phy, vif, link_conf, mlink);
 	if (ret) {
 		if (mlink_alloc)
@@ -175,7 +189,7 @@ void mt76_unassign_vif_chanctx(struct ieee80211_hw *hw,
 		goto out;
 
 	dev->drv->vif_link_remove(phy, vif, link_conf, mlink);
-	mlink->ctx = NULL;
+	mt76_vif_link_ctx_set(mlink, NULL);
 out:
 	mutex_unlock(&dev->mutex);
 }
@@ -202,8 +216,10 @@ int mt76_switch_vif_chanctx(struct ieee80211_hw *hw,
 		else
 			phy = new_ctx->phy;
 
-		if (!phy)
-			return -EINVAL;
+		if (!phy) {
+			ret = -EINVAL;
+			goto restart_mac_work;
+		}
 
 		if (need_update[phy->band_idx])
 			continue;
@@ -253,13 +269,16 @@ int mt76_switch_vif_chanctx(struct ieee80211_hw *hw,
 				goto out;
 		}
 
-		mlink->ctx = v->new_ctx;
-		if (mlink->beacon_mon_interval)
-			WRITE_ONCE(mlink->beacon_mon_last, jiffies);
+		mt76_vif_link_ctx_set(mlink, v->new_ctx);
 	}
 
 out:
 	mutex_unlock(&dev->mutex);
+
+restart_mac_work:
+	for (i = 0; i < ARRAY_SIZE(need_update); i++)
+		if (need_update[i] && dev->phys[i])
+			mt76_phy_mac_work_restart(dev->phys[i]);
 
 	return ret;
 }
@@ -311,16 +330,78 @@ void mt76_put_vif_phy_link(struct mt76_phy *phy, struct ieee80211_vif *vif,
 	kfree_rcu(mlink, rcu_head);
 }
 
+struct mt76_csa_active_data {
+	struct mt76_phy *phy;
+	bool active;
+};
+
+static void
+mt76_csa_active_iter(void *priv, u8 *mac, struct ieee80211_vif *vif)
+{
+	struct mt76_csa_active_data *data = priv;
+	struct ieee80211_bss_conf *link_conf;
+	struct mt76_vif_link *mlink;
+	unsigned int link_id;
+
+	switch (vif->type) {
+	case NL80211_IFTYPE_AP:
+	case NL80211_IFTYPE_MESH_POINT:
+	case NL80211_IFTYPE_ADHOC:
+		break;
+	default:
+		return;
+	}
+
+	for_each_vif_active_link(vif, link_conf, link_id) {
+		if (!link_conf->csa_active)
+			continue;
+
+		mlink = mt76_vif_link(data->phy->dev, vif, link_id);
+		if (mlink && mt76_vif_link_phy(mlink) == data->phy)
+			data->active = true;
+	}
+}
+
+bool mt76_phy_csa_active(struct mt76_phy *phy)
+{
+	struct mt76_csa_active_data data = {
+		.phy = phy,
+	};
+
+	lockdep_assert_held(&phy->dev->mutex);
+
+	ieee80211_iterate_active_interfaces_mtx(phy->hw,
+						IEEE80211_IFACE_ITER_NORMAL,
+						mt76_csa_active_iter, &data);
+
+	return data.active;
+}
+
+static struct mt76_phy *
+mt76_vif_roc_phy(struct mt76_dev *dev, struct ieee80211_vif *vif)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(dev->phys); i++) {
+		struct mt76_phy *phy = dev->phys[i];
+
+		if (phy && phy->roc_vif == vif)
+			return phy;
+	}
+
+	return NULL;
+}
+
 void mt76_roc_complete(struct mt76_phy *phy)
 {
-	struct mt76_vif_link *mlink = phy->roc_link;
+	struct mt76_vif_link *mlink = mt76_dereference(phy->roc_link, phy->dev);
 	struct mt76_dev *dev = phy->dev;
 
 	if (!phy->roc_vif)
 		return;
 
-	if (mlink)
-		mlink->mvif->roc_phy = NULL;
+	if (mlink && mlink->mvif->roc_phy == phy)
+		WRITE_ONCE(mlink->mvif->roc_phy, NULL);
 	if (phy->chanctx && phy->main_chandef.chan && phy->offchannel &&
 	    !test_bit(MT76_MCU_RESET, &dev->phy.state)) {
 		__mt76_set_channel(phy, &phy->main_chandef, false);
@@ -328,9 +409,9 @@ void mt76_roc_complete(struct mt76_phy *phy)
 	} else {
 		phy->offchannel = false;
 	}
-	mt76_put_vif_phy_link(phy, phy->roc_vif, phy->roc_link);
+	rcu_assign_pointer(phy->roc_link, NULL);
+	mt76_put_vif_phy_link(phy, phy->roc_vif, mlink);
 	phy->roc_vif = NULL;
-	phy->roc_link = NULL;
 	if (!test_bit(MT76_RESTART, &dev->phy.state))
 		ieee80211_remain_on_channel_expired(phy->hw);
 }
@@ -376,31 +457,36 @@ int mt76_remain_on_channel(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 
 	mutex_lock(&dev->mutex);
 
-	if (phy->roc_vif || mt76_phy_scanning(phy) ||
-	    test_bit(MT76_MCU_RESET, &dev->phy.state) ||
+	if (test_bit(MT76_MCU_RESET, &dev->phy.state) ||
 	    test_bit(MT76_RESTART, &dev->phy.state)) {
 		ret = -EBUSY;
 		goto out;
 	}
 
+	if (phy->roc_vif || mt76_vif_roc_phy(dev, vif) ||
+	    mt76_phy_scanning(phy) || mt76_phy_csa_active(phy)) {
+		ret = -EBUSY;
+		goto restart_mac_work;
+	}
+
 	mlink = mt76_get_vif_phy_link(phy, vif);
 	if (IS_ERR(mlink)) {
 		ret = PTR_ERR(mlink);
-		goto out;
+		goto restart_mac_work;
 	}
 
-	mlink->mvif->roc_phy = phy;
+	WRITE_ONCE(mlink->mvif->roc_phy, phy);
 	phy->roc_vif = vif;
-	phy->roc_link = mlink;
+	rcu_assign_pointer(phy->roc_link, mlink);
 
 	offchannel = mt76_offchannel_chandef(phy, chan, &chandef);
 	if (offchannel)
 		mt76_offchannel_notify(phy, true);
 	ret = __mt76_set_channel(phy, &chandef, offchannel);
 	if (ret) {
-		mlink->mvif->roc_phy = NULL;
+		WRITE_ONCE(mlink->mvif->roc_phy, NULL);
 		phy->roc_vif = NULL;
-		phy->roc_link = NULL;
+		rcu_assign_pointer(phy->roc_link, NULL);
 		mt76_put_vif_phy_link(phy, vif, mlink);
 		goto out;
 	}
@@ -408,6 +494,10 @@ int mt76_remain_on_channel(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 	ieee80211_queue_delayed_work(phy->hw, &phy->roc_work,
 				     msecs_to_jiffies(duration));
 
+	goto out;
+
+restart_mac_work:
+	mt76_phy_mac_work_restart(phy);
 out:
 	mutex_unlock(&dev->mutex);
 	return ret;
@@ -417,14 +507,16 @@ EXPORT_SYMBOL_GPL(mt76_remain_on_channel);
 int mt76_cancel_remain_on_channel(struct ieee80211_hw *hw,
 				  struct ieee80211_vif *vif)
 {
-	struct mt76_vif_link *mlink = (struct mt76_vif_link *)vif->drv_priv;
-	struct mt76_vif_data *mvif = mlink->mvif;
-	struct mt76_phy *phy = mvif->roc_phy;
+	struct mt76_phy *phy = hw->priv;
+	struct mt76_dev *dev = phy->dev;
 
-	if (!phy || phy->roc_vif != vif)
-		return 0;
+	/* a completion holds the mutex until it reported the expiry */
+	mutex_lock(&dev->mutex);
+	phy = mt76_vif_roc_phy(dev, vif);
+	mutex_unlock(&dev->mutex);
 
-	mt76_abort_roc(phy);
+	if (phy)
+		mt76_abort_roc(phy);
 
 	return 0;
 }

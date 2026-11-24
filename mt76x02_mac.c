@@ -166,7 +166,8 @@ void mt76x02_mac_wcid_setup(struct mt76x02_dev *dev, u8 idx,
 }
 EXPORT_SYMBOL_GPL(mt76x02_mac_wcid_setup);
 
-void mt76x02_mac_wcid_set_drop(struct mt76x02_dev *dev, u8 idx, bool drop)
+static void
+__mt76x02_mac_wcid_set_drop(struct mt76x02_dev *dev, u8 idx, bool drop)
 {
 	u32 val = mt76_rr(dev, MT_WCID_DROP(idx));
 	u32 bit = MT_WCID_DROP_MASK(idx);
@@ -174,6 +175,19 @@ void mt76x02_mac_wcid_set_drop(struct mt76x02_dev *dev, u8 idx, bool drop)
 	/* prevent unnecessary writes */
 	if ((val & bit) != (bit * drop))
 		mt76_wr(dev, MT_WCID_DROP(idx), (val & ~bit) | (bit * drop));
+}
+
+void mt76x02_mac_wcid_set_drop(struct mt76x02_dev *dev, u8 idx, bool drop)
+{
+	/* USB register access can sleep, and mt76.mutex serialises USB callers */
+	if (!mt76_is_mmio(&dev->mt76)) {
+		__mt76x02_mac_wcid_set_drop(dev, idx, drop);
+		return;
+	}
+
+	spin_lock_bh(&dev->mt76.lock);
+	__mt76x02_mac_wcid_set_drop(dev, idx, drop);
+	spin_unlock_bh(&dev->mt76.lock);
 }
 
 static u16
@@ -883,9 +897,11 @@ int mt76x02_mac_process_rx(struct mt76x02_dev *dev, struct sk_buff *skb,
 	status->freq = dev->mphy.chandef.chan->center_freq;
 	status->band = dev->mphy.chandef.chan->band;
 
-	hdr = (struct ieee80211_hdr *)skb->data;
-	status->qos_ctl = *ieee80211_get_qos_ctl(hdr);
 	status->seqno = FIELD_GET(MT_RXWI_SN, tid_sn);
+
+	hdr = (struct ieee80211_hdr *)skb->data;
+	if (ieee80211_is_data_qos(hdr->frame_control))
+		status->qos_ctl = *ieee80211_get_qos_ctl(hdr);
 
 	return mt76x02_mac_process_rate(dev, status, rate);
 }

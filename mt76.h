@@ -257,6 +257,7 @@ struct mt76_queue {
 	int ndesc;
 	int queued;
 	int buf_size;
+	int pending;
 	bool stopped;
 	bool blocked;
 
@@ -405,6 +406,7 @@ struct mt76_wcid {
 	u8 sta:1;
 	u8 sta_disabled:1;
 	u8 amsdu:1;
+	u8 nan_dw:1;
 	u8 phy_idx:2;
 	u8 link_id:4;
 	bool link_valid;
@@ -548,6 +550,7 @@ struct mt76_hw_cap {
 #define MT_DRV_AMSDU_OFFLOAD		BIT(5)
 #define MT_DRV_IGNORE_TXS_FAILED	BIT(6)
 #define MT_DRV_HW_PS_BUFFERING		BIT(7)
+#define MT_DRV_KEEP_REPLAYED_STA	BIT(8)
 
 struct mt76_driver_ops {
 	u32 drv_flags;
@@ -708,6 +711,16 @@ struct mt76_sdio {
 	struct sdio_func *func;
 	void *intr_data;
 	u8 hw_ver;
+
+	/*
+	 * RX enhance mode (CONNAC1): the chip appends the next interrupt
+	 * status (intr_size bytes, after 4 bytes of zero padding) to every
+	 * RX data read, saving a separate status read while frames stream.
+	 */
+	bool rx_enhance;
+	bool intr_pending;
+	u16 intr_size;
+	void *intr_next;
 	wait_queue_head_t wait;
 
 	int pse_mcu_quota_max;
@@ -772,7 +785,7 @@ struct mt76_rx_status {
 		} eht;
 	};
 
-	u8 amsdu:1, first_amsdu:1, last_amsdu:1;
+	u8 amsdu:1, first_amsdu:1, last_amsdu:1, skip_pn_check:1;
 	u8 rate_idx;
 	u8 nss:5, band:3;
 	u8 chains;
@@ -843,6 +856,7 @@ struct mt76_vif_link {
 	u8 basic_rates_idx;
 	u8 mcast_rates_idx;
 	u8 beacon_rates_idx;
+	u8 bmc_wcid; /* 0: bmc shares the vif wcid */
 	bool offchannel;
 	unsigned long beacon_mon_last;
 	u16 beacon_mon_interval;
@@ -869,7 +883,6 @@ struct mt76_phy {
 	unsigned int num_sta;
 	u8 band_idx;
 
-	spinlock_t tx_lock;
 	struct list_head tx_list;
 	struct mt76_queue *q_tx[__MT_TXQ_MAX];
 
@@ -883,7 +896,7 @@ struct mt76_phy {
 
 	struct delayed_work roc_work;
 	struct ieee80211_vif *roc_vif;
-	struct mt76_vif_link *roc_link;
+	struct mt76_vif_link __rcu *roc_link;
 
 	struct delayed_work scan_work;
 	struct {
@@ -921,9 +934,11 @@ struct mt76_phy {
 	u8 mac_work_count;
 
 	struct {
+		spinlock_t lock;
 		struct sk_buff *head;
 		struct sk_buff **tail;
 		u16 seqno;
+		u16 wcid_idx;
 	} rx_amsdu[__MT_RXQ_MAX];
 
 	struct mt76_freq_range_power *frp;
@@ -983,6 +998,8 @@ struct mt76_dev {
 
 	struct mt76_worker tx_worker;
 	struct napi_struct tx_napi;
+	/* protects the tx_list of every phy */
+	spinlock_t tx_lock;
 
 	spinlock_t token_lock;
 	struct idr token;
@@ -1262,6 +1279,9 @@ int mt76_wed_net_setup_tc(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 			  void *type_data);
 #ifdef CONFIG_NET_MEDIATEK_SOC_WED
 u32 mt76_wed_init_rx_buf(struct mtk_wed_device *wed, int size);
+int mt76_wed_flow_prio(struct mtk_wed_device *wed, u16 idx,
+		       const struct cfg80211_flow_info *info, int dscp,
+		       u8 *prio);
 int mt76_wed_offload_enable(struct mtk_wed_device *wed);
 int mt76_wed_dma_setup(struct mt76_dev *dev, struct mt76_queue *q, bool reset);
 #else
@@ -1441,6 +1461,22 @@ mtxq_to_txq(struct mt76_txq *mtxq)
 	return container_of(ptr, struct ieee80211_txq, drv_priv);
 }
 
+static inline void
+mt76_sta_txq_wcid_set(struct ieee80211_sta *sta, u16 idx)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(sta->txq); i++) {
+		struct mt76_txq *mtxq;
+
+		if (!sta->txq[i])
+			continue;
+
+		mtxq = (struct mt76_txq *)sta->txq[i]->drv_priv;
+		mtxq->wcid = idx;
+	}
+}
+
 /* peer-wide state uses the wcid of the primary link */
 static inline struct mt76_wcid *
 mt76_wcid_primary(struct mt76_wcid *wcid)
@@ -1479,6 +1515,9 @@ static inline void *mt76_skb_get_hdr(struct sk_buff *skb)
 	BUILD_BUG_ON(sizeof(struct ieee80211_radiotap_he_mu) % 4);
 
 	mstat = *((struct mt76_rx_status *)skb->cb);
+
+	if (mstat.flag & RX_FLAG_RADIOTAP_TLV_AT_END)
+		return skb_mac_header(skb);
 
 	if (mstat.flag & RX_FLAG_RADIOTAP_HE)
 		data += sizeof(struct ieee80211_radiotap_he);
@@ -1558,6 +1597,7 @@ void mt76_tx_check_agg_ssn(struct ieee80211_sta *sta, struct sk_buff *skb);
 void mt76_txq_schedule(struct mt76_phy *phy, enum mt76_txq_id qid);
 void mt76_txq_schedule_all(struct mt76_phy *phy);
 void mt76_txq_schedule_pending(struct mt76_phy *phy);
+void mt76_txq_purge_pending(struct mt76_phy *phy);
 void mt76_tx_worker_run(struct mt76_dev *dev);
 void mt76_tx_worker(struct mt76_worker *w);
 void mt76_release_buffered_frames(struct ieee80211_hw *hw,
@@ -1581,6 +1621,45 @@ void mt76_set_stream_caps(struct mt76_phy *phy, bool vht);
 int mt76_rx_aggr_start(struct mt76_dev *dev, struct mt76_wcid *wcid, u8 tid,
 		       u16 ssn, u16 size);
 void mt76_rx_aggr_stop(struct mt76_dev *dev, struct mt76_wcid *wcid, u8 tid);
+
+static inline bool
+mt76_key_has_rx_pn(struct ieee80211_key_conf *key)
+{
+	switch (key->cipher) {
+	case WLAN_CIPHER_SUITE_CCMP:
+	case WLAN_CIPHER_SUITE_CCMP_256:
+	case WLAN_CIPHER_SUITE_GCMP:
+	case WLAN_CIPHER_SUITE_GCMP_256:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static inline bool
+mt76_key_is_bip(struct ieee80211_key_conf *key)
+{
+	switch (key->cipher) {
+	case WLAN_CIPHER_SUITE_AES_CMAC:
+	case WLAN_CIPHER_SUITE_BIP_CMAC_256:
+	case WLAN_CIPHER_SUITE_BIP_GMAC_128:
+	case WLAN_CIPHER_SUITE_BIP_GMAC_256:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static inline void
+mt76_wcid_key_link_setup(struct mt76_wcid *wcid,
+			 struct ieee80211_key_conf *key)
+{
+	/* an IGTK or BIGTK shares the wcid of the GTK */
+	if (key && mt76_key_is_bip(key))
+		return;
+
+	wcid->rx_check_pn = key && mt76_key_has_rx_pn(key);
+}
 
 void mt76_wcid_key_setup(struct mt76_dev *dev, struct mt76_wcid *wcid,
 			 struct ieee80211_key_conf *key);
@@ -1828,6 +1907,7 @@ void mt76_rx_complete(struct mt76_dev *dev, struct sk_buff_head *frames,
 void mt76_rx_poll_complete(struct mt76_dev *dev, enum mt76_rxq_id q,
 			   struct napi_struct *napi);
 void mt76_rx_aggr_reorder(struct sk_buff *skb, struct sk_buff_head *frames);
+void mt76_check_ccmp_pn(struct sk_buff *skb);
 void mt76_testmode_tx_pending(struct mt76_phy *phy);
 void mt76_queue_tx_complete(struct mt76_dev *dev, struct mt76_queue *q,
 			    struct mt76_queue_entry *e);
@@ -1856,6 +1936,7 @@ struct mt76_vif_link *mt76_get_vif_phy_link(struct mt76_phy *phy,
 					    struct ieee80211_vif *vif);
 void mt76_put_vif_phy_link(struct mt76_phy *phy, struct ieee80211_vif *vif,
 			   struct mt76_vif_link *mlink);
+bool mt76_phy_csa_active(struct mt76_phy *phy);
 void mt76_offchannel_notify(struct mt76_phy *phy, bool offchannel);
 
 /* usb */
@@ -2175,15 +2256,45 @@ mt76_vif_conf_link(struct mt76_dev *dev, struct ieee80211_vif *vif,
 	return mt76_dereference(mvif->link[link_conf->link_id], dev);
 }
 
+static inline void
+mt76_vif_link_ctx_set(struct mt76_vif_link *mlink,
+		      struct ieee80211_chanctx_conf *conf)
+{
+	if (conf && mlink->beacon_mon_interval)
+		WRITE_ONCE(mlink->beacon_mon_last, jiffies);
+
+	/* pairs with smp_load_acquire() in mt76_vif_link_phy() */
+	smp_store_release(&mlink->ctx, conf);
+}
+
+static inline void
+mt76_vif_link_beacon_mon_start(struct mt76_vif_link *mlink, u16 beacon_int)
+{
+	u16 interval = msecs_to_jiffies(ieee80211_tu_to_usec(beacon_int) / 1000);
+
+	WRITE_ONCE(mlink->beacon_mon_last, jiffies);
+	/* pairs with smp_load_acquire() in mt76_beacon_mon_iter() */
+	smp_store_release(&mlink->beacon_mon_interval, interval);
+}
+
+static inline void
+mt76_vif_link_beacon_mon_stop(struct mt76_vif_link *mlink)
+{
+	WRITE_ONCE(mlink->beacon_mon_interval, 0);
+}
+
 static inline struct mt76_phy *
 mt76_vif_link_phy(struct mt76_vif_link *mlink)
 {
+	struct ieee80211_chanctx_conf *conf;
 	struct mt76_chanctx *ctx;
 
-	if (!mlink->ctx)
+	/* pairs with smp_store_release() in mt76_vif_link_ctx_set() */
+	conf = smp_load_acquire(&mlink->ctx);
+	if (!conf)
 		return NULL;
 
-	ctx = (struct mt76_chanctx *)mlink->ctx->drv_priv;
+	ctx = (struct mt76_chanctx *)conf->drv_priv;
 
 	return ctx->phy;
 }

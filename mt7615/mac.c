@@ -348,6 +348,7 @@ static int mt7615_mac_fill_rx(struct mt7615_dev *dev, struct sk_buff *skb)
 	u8 chfreq, amsdu_info, qos_ctl = 0;
 	u16 seq_ctrl = 0;
 	__le16 fc = 0;
+	u8 sec_mode;
 
 	memset(status, 0, sizeof(*status));
 
@@ -397,7 +398,9 @@ static int mt7615_mac_fill_rx(struct mt7615_dev *dev, struct sk_buff *skb)
 	if (rxd2 & MT_RXD2_NORMAL_TKIP_MIC_ERR)
 		status->flag |= RX_FLAG_MMIC_ERROR;
 
-	if (FIELD_GET(MT_RXD2_NORMAL_SEC_MODE, rxd2) != 0 &&
+	/* a BIP frame keeps its MME, for mac80211 to check MIC and IPN */
+	sec_mode = FIELD_GET(MT_RXD2_NORMAL_SEC_MODE, rxd2);
+	if (sec_mode != 0 && sec_mode != MT_CIPHER_BIP_CMAC_128 &&
 	    !(rxd2 & (MT_RXD2_NORMAL_CLM | MT_RXD2_NORMAL_CM))) {
 		status->flag |= RX_FLAG_DECRYPTED;
 		status->flag |= RX_FLAG_IV_STRIPPED;
@@ -427,7 +430,7 @@ static int mt7615_mac_fill_rx(struct mt7615_dev *dev, struct sk_buff *skb)
 		u8 *data = (u8 *)rxd;
 
 		if (status->flag & RX_FLAG_DECRYPTED) {
-			switch (FIELD_GET(MT_RXD2_NORMAL_SEC_MODE, rxd2)) {
+			switch (sec_mode) {
 			case MT_CIPHER_AES_CCMP:
 			case MT_CIPHER_CCMP_CCX:
 			case MT_CIPHER_CCMP_256:
@@ -825,7 +828,9 @@ int mt7615_mac_write_txwi(struct mt7615_dev *dev, __le32 *txwi,
 	if (!ieee80211_is_beacon(fc)) {
 		struct ieee80211_hw *hw = mt76_hw(dev);
 
-		val = MT_TXD5_TX_STATUS_HOST | FIELD_PREP(MT_TXD5_PID, pid);
+		val = FIELD_PREP(MT_TXD5_PID, pid);
+		if (!multicast)
+			val |= MT_TXD5_TX_STATUS_HOST;
 		if (!ieee80211_hw_check(hw, SUPPORTS_PS))
 			val |= MT_TXD5_SW_POWER_MGMT;
 		txwi[5] = cpu_to_le32(val);
@@ -903,13 +908,16 @@ void mt7615_mac_sta_poll(struct mt7615_dev *dev)
 	list_splice_init(&dev->mt76.sta_poll_list, &sta_poll_list);
 	spin_unlock_bh(&dev->mt76.sta_poll_lock);
 
-	while (!list_empty(&sta_poll_list)) {
+	while (true) {
 		bool clear = false;
 
+		spin_lock_bh(&dev->mt76.sta_poll_lock);
+		if (list_empty(&sta_poll_list)) {
+			spin_unlock_bh(&dev->mt76.sta_poll_lock);
+			break;
+		}
 		msta = list_first_entry(&sta_poll_list, struct mt7615_sta,
 					wcid.poll_list);
-
-		spin_lock_bh(&dev->mt76.sta_poll_lock);
 		list_del_init(&msta->wcid.poll_list);
 		spin_unlock_bh(&dev->mt76.sta_poll_lock);
 

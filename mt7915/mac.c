@@ -256,7 +256,8 @@ mt7915_wed_check_ppe(struct mt7915_dev *dev, struct mt76_queue *q,
 
 	mtk_wed_device_ppe_check(&dev->mt76.mmio.wed, skb,
 				 FIELD_GET(MT_DMA_PPE_CPU_REASON, info),
-				 FIELD_GET(MT_DMA_PPE_ENTRY, info));
+				 FIELD_GET(MT_DMA_PPE_ENTRY, info),
+				 msta->wcid.idx);
 }
 
 static int
@@ -284,6 +285,7 @@ mt7915_mac_fill_rx(struct mt7915_dev *dev, struct sk_buff *skb,
 	u16 hdr_gap;
 	u16 seq_ctrl = 0;
 	__le16 fc = 0;
+	u8 sec_mode;
 	int idx;
 
 	memset(status, 0, sizeof(*status));
@@ -342,7 +344,9 @@ mt7915_mac_fill_rx(struct mt7915_dev *dev, struct sk_buff *skb,
 	if (rxd1 & MT_RXD1_NORMAL_TKIP_MIC_ERR)
 		status->flag |= RX_FLAG_MMIC_ERROR;
 
-	if (FIELD_GET(MT_RXD1_NORMAL_SEC_MODE, rxd1) != 0 &&
+	/* a BIP frame keeps its MME, for mac80211 to check MIC and IPN */
+	sec_mode = FIELD_GET(MT_RXD1_NORMAL_SEC_MODE, rxd1);
+	if (sec_mode != 0 && sec_mode != MT_CIPHER_BIP_CMAC_128 &&
 	    !(rxd1 & (MT_RXD1_NORMAL_CLM | MT_RXD1_NORMAL_CM))) {
 		status->flag |= RX_FLAG_DECRYPTED;
 		status->flag |= RX_FLAG_IV_STRIPPED;
@@ -372,7 +376,7 @@ mt7915_mac_fill_rx(struct mt7915_dev *dev, struct sk_buff *skb,
 		u8 *data = (u8 *)rxd;
 
 		if (status->flag & RX_FLAG_DECRYPTED) {
-			switch (FIELD_GET(MT_RXD1_NORMAL_SEC_MODE, rxd1)) {
+			switch (sec_mode) {
 			case MT_CIPHER_AES_CCMP:
 			case MT_CIPHER_CCMP_CCX:
 			case MT_CIPHER_CCMP_256:
@@ -1096,8 +1100,11 @@ void mt7915_queue_rx_skb(struct mt76_dev *mdev, enum mt76_rxq_id q,
 void mt7915_mac_cca_stats_reset(struct mt7915_phy *phy)
 {
 	struct mt7915_dev *dev = phy->dev;
-	u32 reg = MT_WF_PHY_RX_CTRL1(phy->mt76->band_idx);
+	u8 band = phy->mt76->band_idx;
+	u32 reg;
 
+	reg = is_mt7915(&dev->mt76) ? MT_WF_PHY_RX_CTRL1(band) :
+				      MT_WF_PHY_RX_CTRL1_MT7916(band);
 	mt76_clear(dev, reg, MT_WF_PHY_RX_CTRL1_STSCNT_EN);
 	mt76_set(dev, reg, BIT(11) | BIT(9));
 }
@@ -1404,6 +1411,17 @@ mt7915_mac_restart(struct mt7915_dev *dev)
 			goto out;
 	}
 
+	/* the reloaded firmware counts the MIB airtime from zero */
+	if (!run_main)
+		dev->phy.counter_reset = false;
+	else if (!ret)
+		ret = mt7915_mcu_get_chan_mib_info(&dev->phy, true);
+
+	if (phy2 && !run_ext)
+		phy2->counter_reset = false;
+	else if (run_ext && !ret)
+		ret = mt7915_mcu_get_chan_mib_info(phy2, true);
+
 out:
 	/* reset done */
 	clear_bit(MT76_RESET, &dev->mphy.state);
@@ -1424,6 +1442,7 @@ out:
 static void
 mt7915_mac_full_reset(struct mt7915_dev *dev)
 {
+	struct mt7915_twt_flow *flow, *tmp;
 	struct mt76_phy *ext_phy;
 	struct mt7915_phy *phy2;
 	int i;
@@ -1454,17 +1473,31 @@ mt7915_mac_full_reset(struct mt7915_dev *dev)
 	if (i == 10)
 		dev_err(dev->mt76.dev, "chip full reset failed\n");
 
+	if (dev->rdd2_phy)
+		cfg80211_background_cac_abort(dev->rdd2_phy->mt76->hw->wiphy);
+
 	dev->phy.omac_mask = 0;
 	if (phy2)
 		phy2->omac_mask = 0;
 
 	mt76_reset_device(&dev->mt76);
 
-	INIT_LIST_HEAD(&dev->sta_rc_list);
-	INIT_LIST_HEAD(&dev->twt_list);
+	spin_lock_bh(&dev->mt76.sta_poll_lock);
+	while (!list_empty(&dev->sta_rc_list))
+		list_del_init(dev->sta_rc_list.next);
+	spin_unlock_bh(&dev->mt76.sta_poll_lock);
 
-	i = mt76_wcid_alloc(dev->mt76.wcid_mask, MT7915_WTBL_STA);
-	dev->mt76.global_wcid.idx = i;
+	list_for_each_entry_safe(flow, tmp, &dev->twt_list, list) {
+		struct mt7915_sta *msta;
+
+		msta = container_of(flow, struct mt7915_sta, twt.flow[flow->id]);
+		msta->twt.flowid_mask &= ~BIT(flow->id);
+		list_del_init(&flow->list);
+	}
+	dev->twt.table_mask = 0;
+	dev->twt.n_agrt = 0;
+
+	mt7915_global_wcid_init(dev);
 	dev->recovery.hw_full_reset = false;
 
 	mutex_unlock(&dev->mt76.mutex);
@@ -2351,13 +2384,12 @@ void mt7915_mac_add_twt_setup(struct ieee80211_hw *hw,
 	if (sta_setup_cmd == TWT_SETUP_CMD_REQUEST ||
 	    sta_setup_cmd == TWT_SETUP_CMD_SUGGEST) {
 		u64 interval = (u64)le16_to_cpu(twt_agrt->mantissa) << exp;
-		u64 flow_tsf, curr_tsf;
-		u32 rem;
+		u64 flow_tsf, curr_tsf, rem;
 
 		flow->sched = true;
 		flow->start_tsf = mt7915_mac_twt_sched_list_add(dev, flow);
 		curr_tsf = __mt7915_get_tsf(hw, msta->vif);
-		div_u64_rem(curr_tsf - flow->start_tsf, interval, &rem);
+		div64_u64_rem(curr_tsf - flow->start_tsf, interval, &rem);
 		flow_tsf = curr_tsf + interval - rem;
 		twt_agrt->twt = cpu_to_le64(flow_tsf);
 	} else {
