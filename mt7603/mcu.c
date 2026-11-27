@@ -339,7 +339,7 @@ int mt7603_mcu_set_eeprom(struct mt7603_dev *dev)
 	return ret;
 }
 
-static int mt7603_mcu_set_tx_power(struct mt7603_dev *dev)
+static int mt7603_mcu_set_tx_power(struct mt7603_dev *dev, u8 power_drop)
 {
 	struct {
 		u8 center_channel;
@@ -350,7 +350,7 @@ static int mt7603_mcu_set_tx_power(struct mt7603_dev *dev)
 		u8 bw_power_delta;
 		u8 ch_power_delta[6];
 		u8 temp_comp_power[17];
-		u8 reserved;
+		u8 power_drop;
 	} req = {
 		.center_channel = dev->mphy.chandef.chan->hw_value,
 #define EEP_VAL(n) ((u8 *)dev->mt76.eeprom.data)[n]
@@ -370,6 +370,7 @@ static int mt7603_mcu_set_tx_power(struct mt7603_dev *dev)
 			EEP_VAL(MT_EE_TX_POWER_1_START_2G + 5)
 		},
 #undef EEP_VAL
+		.power_drop = power_drop,
 	};
 	u8 *eep = (u8 *)dev->mt76.eeprom.data;
 
@@ -404,7 +405,7 @@ int mt7603_mcu_set_channel(struct mt7603_dev *dev)
 		.tx_streams = n_chains,
 		.rx_streams = n_chains,
 	};
-	int i, ret;
+	int i, ret, drop;
 	s8 tx_power;
 
 	if (dev->mphy.chandef.width == NL80211_CHAN_WIDTH_40) {
@@ -420,6 +421,8 @@ int mt7603_mcu_set_channel(struct mt7603_dev *dev)
 
 	dev->mphy.txpower_cur = tx_power;
 
+	drop = DIV_ROUND_UP(dev->tx_power_limit - tx_power, 2);
+
 	for (i = 0; i < ARRAY_SIZE(req.txpower); i++)
 		req.txpower[i] = tx_power;
 
@@ -428,5 +431,5 @@ int mt7603_mcu_set_channel(struct mt7603_dev *dev)
 	if (ret)
 		return ret;
 
-	return mt7603_mcu_set_tx_power(dev);
+	return mt7603_mcu_set_tx_power(dev, drop);
 }
