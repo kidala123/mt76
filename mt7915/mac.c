@@ -61,7 +61,7 @@ static struct mt76_wcid *mt7915_rx_get_wcid(struct mt7915_dev *dev,
 		return wcid;
 
 	if (!wcid->sta)
-		return NULL;
+		return mt76_rx_group_wcid(wcid);
 
 	sta = container_of(wcid, struct mt7915_sta, wcid);
 	if (!sta->vif)
@@ -314,6 +314,8 @@ mt7915_mac_fill_rx(struct mt7915_dev *dev, struct sk_buff *skb,
 		status->flag |= RX_FLAG_ONLY_MONITOR;
 
 	unicast = FIELD_GET(MT_RXD3_NORMAL_ADDR_TYPE, rxd3) == MT_RXD3_NORMAL_U2M;
+	status->group = !unicast;
+	status->key_id = FIELD_GET(MT_RXD1_NORMAL_KEY_ID, rxd1);
 	idx = FIELD_GET(MT_RXD1_NORMAL_WLAN_IDX, rxd1);
 	status->wcid = mt7915_rx_get_wcid(dev, idx, unicast);
 
@@ -1252,11 +1254,12 @@ mt7915_wait_reset_state(struct mt7915_dev *dev, u32 state)
 	bool ret;
 
 	ret = wait_event_timeout(dev->reset_wait,
-				 (READ_ONCE(dev->recovery.state) & state),
+				 (READ_ONCE(dev->recovery.state) & state) ||
+				 dev->recovery.restart,
 				 MT7915_RESET_TIMEOUT);
 
 	WARN(!ret, "Timeout waiting for MCU reset state %x\n", state);
-	return ret;
+	return ret && !dev->recovery.restart;
 }
 
 static void
@@ -1511,6 +1514,72 @@ mt7915_mac_full_reset(struct mt7915_dev *dev)
 		ieee80211_restart_hw(ext_phy->hw);
 }
 
+static void
+mt7915_mac_reset_sta_ps(struct mt7915_dev *dev)
+{
+	int i;
+
+	rcu_read_lock();
+	for (i = 0; i < ARRAY_SIZE(dev->mt76.wcid); i++) {
+		struct mt76_wcid *wcid = mt76_wcid_ptr(dev, i);
+
+		if (!wcid_to_sta(wcid) ||
+		    !test_bit(MT_WCID_FLAG_PS, &wcid->flags))
+			continue;
+
+		mt7915_mac_sta_ps_transition(dev, wcid, false);
+	}
+	rcu_read_unlock();
+}
+
+static void
+mt7915_mac_reset_napi_enable(struct mt7915_dev *dev)
+{
+	int i;
+
+	mt76_for_each_q_rx(&dev->mt76, i) {
+		napi_enable(&dev->mt76.napi[i]);
+	}
+
+	local_bh_disable();
+	mt76_for_each_q_rx(&dev->mt76, i) {
+		napi_schedule(&dev->mt76.napi[i]);
+	}
+	local_bh_enable();
+
+	tasklet_schedule(&dev->mt76.irq_tasklet);
+
+	mt76_worker_enable(&dev->mt76.tx_worker);
+
+	napi_enable(&dev->mt76.tx_napi);
+	local_bh_disable();
+	napi_schedule(&dev->mt76.tx_napi);
+	local_bh_enable();
+}
+
+static void
+mt7915_mac_reset_l1_abort(struct mt7915_dev *dev)
+{
+	mt7915_mac_reset_napi_enable(dev);
+	mutex_unlock(&dev->mt76.mutex);
+
+	spin_lock_bh(&dev->mt76.lock);
+	mt7915_mac_full_reset_queue(dev);
+	spin_unlock_bh(&dev->mt76.lock);
+}
+
+/* MT76_MCU_RESET keeps every command from the firmware until the reload */
+void mt7915_mac_full_reset_queue(struct mt7915_dev *dev)
+{
+	lockdep_assert_held(&dev->mt76.lock);
+
+	set_bit(MT76_MCU_RESET, &dev->mphy.state);
+	dev->recovery.restart = true;
+	wake_up(&dev->mt76.mcu.wait);
+	queue_work(dev->mt76.wq, &dev->reset_work);
+	wake_up(&dev->reset_wait);
+}
+
 /* system error recovery */
 void mt7915_mac_reset_work(struct work_struct *work)
 {
@@ -1577,19 +1646,23 @@ void mt7915_mac_reset_work(struct work_struct *work)
 		mtk_wed_device_stop(&dev->mt76.mmio.wed);
 
 	mt76_wr(dev, MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_DMA_STOPPED);
+	if (!mt7915_wait_reset_state(dev, MT_MCU_CMD_RESET_DONE))
+		goto abort;
 
-	if (mt7915_wait_reset_state(dev, MT_MCU_CMD_RESET_DONE)) {
-		mt7915_dma_reset(dev, false);
+	mt7915_dma_reset(dev, false);
 
-		mt76_connac2_tx_token_put(&dev->mt76);
-		idr_init(&dev->mt76.token);
+	mt76_connac2_tx_token_put(&dev->mt76);
+	idr_init(&dev->mt76.token);
 
-		mt76_wr(dev, MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_DMA_INIT);
-		mt7915_wait_reset_state(dev, MT_MCU_CMD_RECOVERY_DONE);
-	}
+	mt76_wr(dev, MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_DMA_INIT);
+	if (!mt7915_wait_reset_state(dev, MT_MCU_CMD_RECOVERY_DONE))
+		goto abort;
 
 	mt76_wr(dev, MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_RESET_DONE);
-	mt7915_wait_reset_state(dev, MT_MCU_CMD_NORMAL_STATE);
+	if (!mt7915_wait_reset_state(dev, MT_MCU_CMD_NORMAL_STATE))
+		goto abort;
+
+	mt7915_mac_reset_sta_ps(dev);
 
 	/* enable DMA Tx/Rx and interrupt */
 	mt7915_dma_start(dev, false, false);
@@ -1599,24 +1672,7 @@ void mt7915_mac_reset_work(struct work_struct *work)
 	if (phy2)
 		clear_bit(MT76_RESET, &phy2->mt76->state);
 
-	mt76_for_each_q_rx(&dev->mt76, i) {
-		napi_enable(&dev->mt76.napi[i]);
-	}
-
-	local_bh_disable();
-	mt76_for_each_q_rx(&dev->mt76, i) {
-		napi_schedule(&dev->mt76.napi[i]);
-	}
-	local_bh_enable();
-
-	tasklet_schedule(&dev->mt76.irq_tasklet);
-
-	mt76_worker_enable(&dev->mt76.tx_worker);
-
-	napi_enable(&dev->mt76.tx_napi);
-	local_bh_disable();
-	napi_schedule(&dev->mt76.tx_napi);
-	local_bh_enable();
+	mt7915_mac_reset_napi_enable(dev);
 
 	ieee80211_wake_queues(mt76_hw(dev));
 	if (ext_phy)
@@ -1632,6 +1688,10 @@ void mt7915_mac_reset_work(struct work_struct *work)
 		ieee80211_queue_delayed_work(ext_phy->hw,
 					     &phy2->mt76->mac_work,
 					     MT7915_WATCHDOG_TIME);
+	return;
+
+abort:
+	mt7915_mac_reset_l1_abort(dev);
 }
 
 /* firmware coredump */
@@ -1706,11 +1766,13 @@ skip_coredump:
 
 void mt7915_reset(struct mt7915_dev *dev)
 {
+	spin_lock_bh(&dev->mt76.lock);
+
 	if (!dev->recovery.hw_init_done)
-		return;
+		goto out;
 
 	if (dev->recovery.hw_full_reset)
-		return;
+		goto out;
 
 	/* wm/wa exception: do full recovery */
 	if (READ_ONCE(dev->recovery.state) & MT_MCU_CMD_WDT_MASK) {
@@ -1721,7 +1783,7 @@ void mt7915_reset(struct mt7915_dev *dev)
 
 		mt7915_irq_disable(dev, MT_INT_MCU_CMD);
 		queue_work(dev->mt76.wq, &dev->dump_work);
-		return;
+		goto out;
 	}
 
 	if ((READ_ONCE(dev->recovery.state) & MT_MCU_CMD_STOP_DMA)) {
@@ -1731,6 +1793,8 @@ void mt7915_reset(struct mt7915_dev *dev)
 
 	queue_work(dev->mt76.wq, &dev->reset_work);
 	wake_up(&dev->reset_wait);
+out:
+	spin_unlock_bh(&dev->mt76.lock);
 }
 
 void mt7915_mac_update_stats(struct mt7915_phy *phy)
@@ -2009,12 +2073,18 @@ void mt7915_mac_sta_rc_work(struct work_struct *work)
 	u32 changed;
 	LIST_HEAD(list);
 
+	mutex_lock(&dev->mt76.mutex);
+
 	spin_lock_bh(&dev->mt76.sta_poll_lock);
 	list_splice_init(&dev->sta_rc_list, &list);
 
 	while (!list_empty(&list)) {
 		msta = list_first_entry(&list, struct mt7915_sta, rc_list);
 		list_del_init(&msta->rc_list);
+
+		if (test_bit(MT_WCID_FLAG_PS, &msta->wcid.flags))
+			continue;
+
 		changed = msta->changed;
 		msta->changed = 0;
 		spin_unlock_bh(&dev->mt76.sta_poll_lock);
@@ -2034,6 +2104,29 @@ void mt7915_mac_sta_rc_work(struct work_struct *work)
 	}
 
 	spin_unlock_bh(&dev->mt76.sta_poll_lock);
+
+	mutex_unlock(&dev->mt76.mutex);
+}
+
+void mt7915_mac_sta_ps_transition(struct mt7915_dev *dev,
+				  struct mt76_wcid *wcid, bool ps)
+{
+	struct mt7915_sta *msta = container_of(wcid, struct mt7915_sta, wcid);
+	bool held;
+
+	mt76_sta_ps_transition(&dev->mt76, wcid, ps);
+	if (ps)
+		return;
+
+	spin_lock_bh(&dev->mt76.sta_poll_lock);
+	held = msta->changed && list_empty(&msta->rc_list);
+	if (held)
+		list_add_tail(&msta->rc_list, &dev->sta_rc_list);
+	spin_unlock_bh(&dev->mt76.sta_poll_lock);
+
+	if (held)
+		ieee80211_queue_work(mt76_phy_hw(&dev->mt76, wcid->phy_idx),
+				     &dev->rc_work);
 }
 
 void mt7915_mac_work(struct work_struct *work)

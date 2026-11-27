@@ -13,6 +13,7 @@
 #define MT_STA_BFER			BIT(0)
 #define MT_STA_BFEE			BIT(1)
 #define MT7925_WOW_PATTERN_NEW_FW_DATE	"20260414153105"
+#define MT7925_COREDUMP_END_STR		"; coredump end"
 
 static bool mt7925_vif_is_nan(struct ieee80211_vif *vif)
 {
@@ -762,10 +763,19 @@ mt7925_mcu_uni_rx_unsolicited_event(struct mt792x_dev *dev,
 	case MCU_UNI_EVENT_RSSI_MONITOR:
 		mt7925_mcu_rssi_monitor_event(dev, skb);
 		break;
-	case MCU_UNI_EVENT_COREDUMP:
+	case MCU_UNI_EVENT_COREDUMP: {
+		size_t hdr_len = sizeof(struct mt7925_mcu_rxd) + 8;
+		bool end;
+
 		dev->fw_assert = true;
+		end = skb->len > hdr_len &&
+		      strnstr(skb->data + hdr_len, MT7925_COREDUMP_END_STR,
+			      skb->len - hdr_len);
 		mt76_connac_mcu_coredump_event(&dev->mt76, skb, &dev->coredump);
+		if (end)
+			dev->coredump.complete = true;
 		return;
+	}
 	case MCU_UNI_EVENT_NAN:
 		mt7925_nan_mcu_event(dev, skb);
 		break;
@@ -1239,37 +1249,13 @@ out:
 	return ret;
 }
 
-int mt7925_mcu_chip_config(struct mt792x_dev *dev, const char *cmd)
-{
-	u16 len = strlen(cmd) + 1;
-	struct {
-		u8 _rsv[4];
-		__le16 tag;
-		__le16 len;
-		struct mt76_connac_config config;
-	} __packed req = {
-		.tag = cpu_to_le16(UNI_CHIP_CONFIG_CHIP_CFG),
-		.len = cpu_to_le16(sizeof(req) - 4),
-		.config = {
-			.resp_type = 0,
-			.type = 0,
-			.data_size = cpu_to_le16(len),
-		},
-	};
-
-	memcpy(req.config.data, cmd, len);
-
-	return mt76_mcu_send_msg(&dev->mt76, MCU_UNI_CMD(CHIP_CONFIG),
-				 &req, sizeof(req), false);
-}
-
 int mt7925_mcu_set_deep_sleep(struct mt792x_dev *dev, bool enable)
 {
 	char cmd[16];
 
 	snprintf(cmd, sizeof(cmd), "KeepFullPwr %d", !enable);
 
-	return mt7925_mcu_chip_config(dev, cmd);
+	return mt792x_mcu_chip_config(dev, cmd);
 }
 EXPORT_SYMBOL_GPL(mt7925_mcu_set_deep_sleep);
 
@@ -1280,11 +1266,11 @@ int mt7925_mcu_set_thermal_protect(struct mt792x_dev *dev)
 
 	snprintf(cmd, sizeof(cmd), "ThermalProtGband %d %d %d %d %d %d %d %d %d %d",
 		 0, 100, 90, 80, 30, 1, 1, 115, 105, 5);
-	ret = mt7925_mcu_chip_config(dev, cmd);
+	ret = mt792x_mcu_chip_config(dev, cmd);
 
 	snprintf(cmd, sizeof(cmd), "ThermalProtAband %d %d %d %d %d %d %d %d %d %d",
 		 1, 100, 90, 80, 30, 1, 1, 115, 105, 5);
-	ret |= mt7925_mcu_chip_config(dev, cmd);
+	ret |= mt792x_mcu_chip_config(dev, cmd);
 
 	return ret;
 }

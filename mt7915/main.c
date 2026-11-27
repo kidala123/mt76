@@ -258,6 +258,8 @@ static int mt7915_add_interface(struct ieee80211_hw *hw,
 	mvif->sta.wcid.idx = idx;
 	mvif->sta.wcid.tx_info |= MT_WCID_TX_INFO_SET;
 	mt76_wcid_init(&mvif->sta.wcid, phy->mt76->band_idx);
+	mt76_wcid_rx_group_pn_set(&mvif->sta.wcid, vif,
+				  &mvif->mt76.rx_group_pn);
 
 	mt7915_mac_wtbl_update(dev, idx,
 			       MT_WTBL_UPDATE_ADM_COUNT_CLEAR);
@@ -776,6 +778,7 @@ int mt7915_mac_sta_add(struct mt76_dev *mdev, struct ieee80211_vif *vif,
 	msta->wcid.idx = idx;
 	msta->wcid.phy_idx = ext_phy;
 	msta->jiffies = jiffies;
+	clear_bit(MT_WCID_FLAG_PS, &msta->wcid.flags);
 
 	if (sta->tdls)
 		set_bit(MT_WCID_FLAG_TDLS_PEER, &msta->wcid.flags);
@@ -1351,6 +1354,8 @@ static void mt7915_sta_set_4addr(struct ieee80211_hw *hw,
 	struct mt7915_dev *dev = mt7915_hw_dev(hw);
 	struct mt7915_sta *msta = (struct mt7915_sta *)sta->drv_priv;
 
+	mutex_lock(&dev->mt76.mutex);
+
 	if (enabled)
 		set_bit(MT_WCID_FLAG_4ADDR, &msta->wcid.flags);
 	else
@@ -1359,10 +1364,10 @@ static void mt7915_sta_set_4addr(struct ieee80211_hw *hw,
 	if (mtk_wed_device_active(&dev->mt76.mmio.wed) && enabled)
 		mt7915_sta_wed_set_4addr(dev, vif, sta);
 
-	if (!msta->wcid.sta)
-		return;
+	if (msta->wcid.sta)
+		mt76_connac_mcu_wtbl_update_hdr_trans(&dev->mt76, vif, sta);
 
-	mt76_connac_mcu_wtbl_update_hdr_trans(&dev->mt76, vif, sta);
+	mutex_unlock(&dev->mt76.mutex);
 }
 
 static void mt7915_sta_set_decap_offload(struct ieee80211_hw *hw,
@@ -1373,15 +1378,17 @@ static void mt7915_sta_set_decap_offload(struct ieee80211_hw *hw,
 	struct mt7915_dev *dev = mt7915_hw_dev(hw);
 	struct mt7915_sta *msta = (struct mt7915_sta *)sta->drv_priv;
 
+	mutex_lock(&dev->mt76.mutex);
+
 	if (enabled)
 		set_bit(MT_WCID_FLAG_HDR_TRANS, &msta->wcid.flags);
 	else
 		clear_bit(MT_WCID_FLAG_HDR_TRANS, &msta->wcid.flags);
 
-	if (!msta->wcid.sta)
-		return;
+	if (msta->wcid.sta)
+		mt76_connac_mcu_wtbl_update_hdr_trans(&dev->mt76, vif, sta);
 
-	mt76_connac_mcu_wtbl_update_hdr_trans(&dev->mt76, vif, sta);
+	mutex_unlock(&dev->mt76.mutex);
 }
 
 static void mt7915_sta_set_airtime_weight(struct ieee80211_hw *hw,

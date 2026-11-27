@@ -158,9 +158,8 @@ static ssize_t mt7996_thermal_temp_store(struct device *dev,
 	}
 
 	phy->throttle_temp[i - 1] = val;
-	mutex_unlock(&phy->dev->mt76.mutex);
-
 	ret = mt7996_mcu_set_thermal_protect(phy, true);
+	mutex_unlock(&phy->dev->mt76.mutex);
 	if (ret)
 		return ret;
 
@@ -812,9 +811,7 @@ static void mt7996_init_work(struct work_struct *work)
 	mt7996_mcu_set_eeprom(dev);
 	mt7996_mac_init(dev);
 	mt7996_txbf_init(dev);
-
-	if (!is_mt7990(&dev->mt76))
-		mt7996_mcu_set_dup_wtbl(dev);
+	mt7996_mcu_set_dup_wtbl(dev);
 }
 
 void mt7996_wfsys_reset(struct mt7996_dev *dev)
@@ -1282,7 +1279,8 @@ static int mt7996_variant_fem_init(struct mt7996_dev *dev)
 
 int mt7996_global_wcid_init(struct mt7996_dev *dev)
 {
-	int idx = mt76_wcid_alloc(dev->mt76.wcid_mask, MT7996_WTBL_STA);
+	int idx = mt76_wcid_alloc(dev->mt76.wcid_mask,
+				  mt7996_wtbl_sta_limit(dev));
 
 	if (idx)
 		return -ENOSPC;
@@ -1765,6 +1763,13 @@ void mt7996_set_stream_he_eht_caps(struct mt7996_phy *phy)
 						NL80211_BAND_6GHZ);
 }
 
+static void mt7996_set_hw_init_done(struct mt7996_dev *dev, bool done)
+{
+	spin_lock_bh(&dev->mt76.lock);
+	dev->recovery.hw_init_done = done;
+	spin_unlock_bh(&dev->mt76.lock);
+}
+
 int mt7996_register_device(struct mt7996_dev *dev)
 {
 	struct ieee80211_hw *hw = mt76_hw(dev);
@@ -1814,7 +1819,7 @@ int mt7996_register_device(struct mt7996_dev *dev)
 
 	ieee80211_queue_work(mt76_hw(dev), &dev->init_work);
 
-	dev->recovery.hw_init_done = true;
+	mt7996_set_hw_init_done(dev, true);
 
 	ret = mt7996_init_debugfs(dev);
 	if (ret)
@@ -1836,6 +1841,7 @@ void mt7996_unregister_device(struct mt7996_dev *dev)
 {
 	int i;
 
+	mt7996_set_hw_init_done(dev, false);
 	cancel_work_sync(&dev->dump_work);
 	cancel_work_sync(&dev->wed_rro.work);
 	cancel_work_sync(&dev->reset_work);

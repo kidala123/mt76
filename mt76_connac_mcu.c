@@ -272,6 +272,21 @@ int mt76_connac_mcu_set_rts_thresh(struct mt76_dev *dev, u32 val, u8 band)
 }
 EXPORT_SYMBOL_GPL(mt76_connac_mcu_set_rts_thresh);
 
+int mt76_connac_mcu_uni_set_perf_ind(struct mt76_dev *dev, u32 valid_period,
+				     const u64 *tx_bytes, const u64 *rx_bytes)
+{
+	struct mt76_connac_uni_perf_ind req = {
+		.tag = cpu_to_le16(UNI_PERF_IND_PARM),
+		.len = cpu_to_le16(sizeof(req) - sizeof(req.rsv)),
+	};
+
+	mt76_connac_perf_ind_v1_fill(&req.perf, valid_period, tx_bytes, rx_bytes);
+
+	return mt76_mcu_send_msg(dev, MCU_UNI_CMD(PERF_IND), &req,
+				 sizeof(req), false);
+}
+EXPORT_SYMBOL_GPL(mt76_connac_mcu_uni_set_perf_ind);
+
 void mt76_connac_mcu_beacon_loss_iter(void *priv, u8 *mac,
 				      struct ieee80211_vif *vif)
 {
@@ -2062,6 +2077,41 @@ int mt76_connac_mcu_chip_config(struct mt76_dev *dev, const char *cmd)
 				 &req, sizeof(req), false);
 }
 EXPORT_SYMBOL_GPL(mt76_connac_mcu_chip_config);
+
+/* Unified-command form of chip_config (connac3, e.g. MT7925/MT7928): the same
+ * CE payload carried as a TLV inside MCU_UNI_CMD_CHIP_CONFIG.
+ */
+int mt76_connac_mcu_uni_chip_config(struct mt76_dev *dev, const char *cmd)
+{
+	ssize_t len;
+
+	struct {
+		u8 rsv[4];
+		__le16 tag;
+		__le16 len;
+		struct mt76_connac_config config;
+	} __packed req = {
+		.tag = cpu_to_le16(UNI_CHIP_CONFIG_CHIP_CFG),
+		.len = cpu_to_le16(sizeof(req) - sizeof(req.rsv)),
+		.config = {
+			.resp_type = 0,
+			.type = 0,
+		},
+	};
+
+	if (!cmd)
+		return -EINVAL;
+
+	len = strscpy(req.config.data, cmd);
+	if (len == -E2BIG)
+		return -E2BIG;
+
+	req.config.data_size = cpu_to_le16(len + 1);
+
+	return mt76_mcu_send_msg(dev, MCU_UNI_CMD(CHIP_CONFIG),
+				 &req, sizeof(req), false);
+}
+EXPORT_SYMBOL_GPL(mt76_connac_mcu_uni_chip_config);
 
 int mt76_connac_mcu_set_deep_sleep(struct mt76_dev *dev, bool enable)
 {

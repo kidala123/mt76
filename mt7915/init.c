@@ -383,6 +383,8 @@ mt7915_regd_notifier(struct wiphy *wiphy,
 	struct mt76_phy *mphy = hw->priv;
 	struct mt7915_phy *phy = mphy->priv;
 
+	mutex_lock(&dev->mt76.mutex);
+
 	memcpy(dev->mt76.alpha2, request->alpha2, sizeof(dev->mt76.alpha2));
 	dev->mt76.region = request->dfs_region;
 
@@ -393,6 +395,8 @@ mt7915_regd_notifier(struct wiphy *wiphy,
 
 	mphy->dfs_state = MT_DFS_STATE_UNKNOWN;
 	mt7915_dfs_init_radar_detector(phy);
+
+	mutex_unlock(&dev->mt76.mutex);
 }
 
 static void
@@ -615,7 +619,7 @@ mt7915_init_led_mux(struct mt7915_dev *dev)
 			mt76_rmw_field(dev, MT_LED_GPIO_MUX0,
 				       GENMASK(11, 8), 1);
 			break;
-		case 0x7916:
+		case 0x7906:
 			mt76_rmw_field(dev, MT_LED_GPIO_MUX1,
 				       GENMASK(27, 24), 3);
 			mt76_rmw_field(dev, MT_LED_GPIO_MUX1,
@@ -634,7 +638,7 @@ mt7915_init_led_mux(struct mt7915_dev *dev)
 			mt76_rmw_field(dev, MT_LED_GPIO_MUX0,
 				       GENMASK(11, 8), 1);
 			break;
-		case 0x7916:
+		case 0x7906:
 			mt76_rmw_field(dev, MT_LED_GPIO_MUX1,
 				       GENMASK(31, 28), 3);
 			break;
@@ -651,7 +655,7 @@ mt7915_init_led_mux(struct mt7915_dev *dev)
 			mt76_rmw_field(dev, MT_LED_GPIO_MUX0,
 				       GENMASK(7, 4), 1);
 			break;
-		case 0x7916:
+		case 0x7906:
 			mt76_rmw_field(dev, MT_LED_GPIO_MUX1,
 				       GENMASK(27, 24), 3);
 			break;
@@ -1302,6 +1306,13 @@ static void mt7915_stop_hardware(struct mt7915_dev *dev)
 		mt7986_wmac_disable(dev);
 }
 
+static void mt7915_set_hw_init_done(struct mt7915_dev *dev, bool done)
+{
+	spin_lock_bh(&dev->mt76.lock);
+	dev->recovery.hw_init_done = done;
+	spin_unlock_bh(&dev->mt76.lock);
+}
+
 int mt7915_register_device(struct mt7915_dev *dev)
 {
 	struct mt7915_phy *phy2;
@@ -1353,7 +1364,7 @@ int mt7915_register_device(struct mt7915_dev *dev)
 
 	ieee80211_queue_work(mt76_hw(dev), &dev->init_work);
 
-	dev->recovery.hw_init_done = true;
+	mt7915_set_hw_init_done(dev, true);
 
 	ret = mt7915_init_debugfs(&dev->phy);
 	if (ret)
@@ -1366,6 +1377,10 @@ int mt7915_register_device(struct mt7915_dev *dev)
 	return 0;
 
 unreg_ext_phy:
+	mt7915_set_hw_init_done(dev, false);
+	cancel_work_sync(&dev->init_work);
+	cancel_work_sync(&dev->dump_work);
+	cancel_work_sync(&dev->reset_work);
 	if (phy2) {
 		mt7915_unregister_ext_phy(dev);
 		phy2 = NULL;
@@ -1384,6 +1399,7 @@ free_phy2:
 
 void mt7915_unregister_device(struct mt7915_dev *dev)
 {
+	mt7915_set_hw_init_done(dev, false);
 	cancel_work_sync(&dev->dump_work);
 	cancel_work_sync(&dev->reset_work);
 	cancel_work_sync(&dev->rc_work);

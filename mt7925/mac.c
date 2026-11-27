@@ -444,6 +444,8 @@ mt7925_mac_fill_rx(struct mt792x_dev *dev, struct sk_buff *skb)
 
 	chfreq = FIELD_GET(MT_RXD3_NORMAL_CH_FREQ, rxd3);
 	unicast = FIELD_GET(MT_RXD3_NORMAL_ADDR_TYPE, rxd3) == MT_RXD3_NORMAL_U2M;
+	status->group = !unicast;
+	status->key_id = FIELD_GET(MT_RXD1_NORMAL_KEY_ID, rxd1);
 	idx = FIELD_GET(MT_RXD1_NORMAL_WLAN_IDX, rxd1);
 	status->wcid = mt792x_rx_get_wcid(dev, idx, unicast);
 
@@ -1539,6 +1541,9 @@ void mt7925_queue_rx_skb(struct mt76_dev *mdev, enum mt76_rxq_id q,
 				return;
 			}
 
+			if (is_mt7928(&dev->mt76))
+				mt792x_perf_account_rx(dev, status->wcid, skb->len);
+
 			mt76_rx(&dev->mt76, q, skb);
 			return;
 		}
@@ -1665,48 +1670,71 @@ void mt7925_mac_reset_vif_work(struct wiphy *wiphy, struct wiphy_work *work)
 
 void mt7925_coredump_work(struct work_struct *work)
 {
+	size_t hdr_len = sizeof(struct mt7925_mcu_rxd) + 8;
+	struct sk_buff_head local_list;
 	struct mt792x_dev *dev;
+	struct sk_buff *skb;
+	size_t total_sz = 0;
 	char *dump, *data;
 
 	dev = (struct mt792x_dev *)container_of(work, struct mt792x_dev,
 						coredump.work.work);
 
-	if (time_is_after_jiffies(dev->coredump.last_activity +
+	/* if received the last coredump payload or timeout, start
+	 * saving coredump file and trigger reset.
+	 * Otherwise, wait for other coredump payload coming
+	 */
+	if (!dev->coredump.complete &&
+	    time_is_after_jiffies(dev->coredump.last_activity +
 				  4 * MT76_CONNAC_COREDUMP_TIMEOUT)) {
 		queue_delayed_work(dev->mt76.wq, &dev->coredump.work,
 				   MT76_CONNAC_COREDUMP_TIMEOUT);
 		return;
 	}
+	dev->coredump.complete = false;
 
-	dump = vzalloc(MT76_CONNAC_COREDUMP_SZ);
+	skb_queue_head_init(&local_list);
+	spin_lock_bh(&dev->mt76.lock);
+	skb_queue_splice_init(&dev->coredump.msg_list, &local_list);
+	spin_unlock_bh(&dev->mt76.lock);
+
+	skb_queue_walk(&local_list, skb) {
+		if (skb->len > hdr_len)
+			total_sz += skb->len - hdr_len;
+	}
+
+	if (!total_sz) {
+		skb_queue_purge(&local_list);
+		goto reset;
+	}
+
+	dump = vzalloc(total_sz);
 	data = dump;
 
 	while (true) {
-		struct sk_buff *skb;
-
-		spin_lock_bh(&dev->mt76.lock);
-		skb = __skb_dequeue(&dev->coredump.msg_list);
-		spin_unlock_bh(&dev->mt76.lock);
+		skb = __skb_dequeue(&local_list);
 
 		if (!skb)
 			break;
 
-		skb_pull(skb, sizeof(struct mt7925_mcu_rxd) + 8);
-		if (!dump || data + skb->len - dump > MT76_CONNAC_COREDUMP_SZ) {
+		if (skb->len <= hdr_len) {
 			dev_kfree_skb(skb);
 			continue;
 		}
 
-		memcpy(data, skb->data, skb->len);
-		data += skb->len;
+		skb_pull(skb, hdr_len);
+		if (dump) {
+			memcpy(data, skb->data, skb->len);
+			data += skb->len;
+		}
 
 		dev_kfree_skb(skb);
 	}
 
 	if (dump)
-		dev_coredumpv(dev->mt76.dev, dump, MT76_CONNAC_COREDUMP_SZ,
-			      GFP_KERNEL);
+		dev_coredumpv(dev->mt76.dev, dump, total_sz, GFP_KERNEL);
 
+reset:
 	mt792x_reset(&dev->mt76);
 }
 

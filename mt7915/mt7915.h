@@ -289,9 +289,9 @@ struct mt7915_dev {
 		u32 state;
 		u32 wa_reset_count;
 		u32 wm_reset_count;
-		bool hw_full_reset:1;
-		bool hw_init_done:1;
-		bool restart:1;
+		bool hw_full_reset;
+		bool hw_init_done;
+		bool restart;
 	} recovery;
 
 	/* protects coredump data */
@@ -484,6 +484,7 @@ int mt7915_dma_start(struct mt7915_dev *dev, bool reset, bool wed_reset);
 int mt7915_txbf_init(struct mt7915_dev *dev);
 void mt7915_init_txpower(struct mt7915_phy *phy);
 void mt7915_reset(struct mt7915_dev *dev);
+void mt7915_mac_full_reset_queue(struct mt7915_dev *dev);
 int mt7915_run(struct ieee80211_hw *hw);
 int mt7915_mcu_init(struct mt7915_dev *dev);
 int mt7915_mcu_init_firmware(struct mt7915_dev *dev);
@@ -640,6 +641,8 @@ void mt7915_mac_work(struct work_struct *work);
 void mt7915_mac_reset_work(struct work_struct *work);
 void mt7915_mac_dump_work(struct work_struct *work);
 void mt7915_mac_sta_rc_work(struct work_struct *work);
+void mt7915_mac_sta_ps_transition(struct mt7915_dev *dev,
+				  struct mt76_wcid *wcid, bool ps);
 void mt7915_mac_update_stats(struct mt7915_phy *phy);
 void mt7915_mac_twt_teardown_flow(struct mt7915_dev *dev,
 				  struct mt7915_sta *msta,

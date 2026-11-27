@@ -485,6 +485,8 @@ mt7996_mac_fill_rx(struct mt7996_dev *dev, enum mt76_rxq_id q,
 		status->flag |= RX_FLAG_ONLY_MONITOR;
 
 	unicast = FIELD_GET(MT_RXD3_NORMAL_ADDR_TYPE, rxd3) == MT_RXD3_NORMAL_U2M;
+	status->group = !unicast;
+	status->key_id = FIELD_GET(MT_RXD1_NORMAL_KEY_ID, rxd1);
 	idx = FIELD_GET(MT_RXD1_NORMAL_WLAN_IDX, rxd1);
 	status->wcid = mt7996_rx_get_wcid(dev, idx, band_idx);
 
@@ -525,6 +527,9 @@ mt7996_mac_fill_rx(struct mt7996_dev *dev, enum mt76_rxq_id q,
 		status->flag |= RX_FLAG_IV_STRIPPED;
 		status->flag |= RX_FLAG_MMIC_STRIPPED | RX_FLAG_MIC_STRIPPED;
 	}
+
+	if (!unicast && !status->wcid && (status->flag & RX_FLAG_DECRYPTED))
+		status->wcid = mt76_rx_group_wcid(mt76_wcid_ptr(dev, idx));
 
 	remove_pad = FIELD_GET(MT_RXD2_NORMAL_HDR_OFFSET, rxd2);
 
@@ -2479,6 +2484,8 @@ mt7996_mac_restart(struct mt7996_dev *dev)
 	if (ret)
 		goto out;
 
+	mt7996_mcu_set_dup_wtbl(dev);
+
 	mt7996_for_each_phy(dev, phy) {
 		if (!test_bit(MT76_STATE_RUNNING, &phy->mt76->state))
 			continue;
@@ -2523,6 +2530,24 @@ mt7996_mac_reset_sta_iter(void *data, struct ieee80211_sta *sta)
 
 	for (i = 0; i < ARRAY_SIZE(msta->link); i++)
 		mt7996_mac_sta_remove_link(dev, sta, i, true);
+}
+
+static void
+mt7996_mac_reset_sta_ps(struct mt7996_dev *dev)
+{
+	int i;
+
+	rcu_read_lock();
+	for (i = 0; i < ARRAY_SIZE(dev->mt76.wcid); i++) {
+		struct mt76_wcid *wcid = mt76_wcid_ptr(dev, i);
+
+		if (!wcid_to_sta(wcid) ||
+		    !test_bit(MT_WCID_FLAG_PS, &wcid->flags))
+			continue;
+
+		mt76_sta_ps_transition(&dev->mt76, wcid, false);
+	}
+	rcu_read_unlock();
 }
 
 static void
@@ -2605,7 +2630,8 @@ mt7996_mac_full_reset(struct mt7996_dev *dev)
 
 		msta_link = container_of(flow, struct mt7996_sta_link,
 					 twt.flow[flow->id]);
-		msta_link->twt.flowid_mask &= ~BIT(flow->id);
+		WRITE_ONCE(msta_link->twt.flowid_mask,
+			   msta_link->twt.flowid_mask & ~BIT(flow->id));
 		list_del_init(&flow->list);
 	}
 	dev->twt.table_mask = 0;
@@ -2632,6 +2658,18 @@ mt7996_mac_full_reset(struct mt7996_dev *dev)
 	ieee80211_wake_queues(mt76_hw(dev));
 
 	ieee80211_restart_hw(mt76_hw(dev));
+}
+
+/* MT76_MCU_RESET keeps every command from the firmware until the reload */
+void mt7996_mac_full_reset_queue(struct mt7996_dev *dev)
+{
+	lockdep_assert_held(&dev->mt76.lock);
+
+	set_bit(MT76_MCU_RESET, &dev->mphy.state);
+	dev->recovery.restart = true;
+	wake_up(&dev->mt76.mcu.wait);
+	queue_work(dev->mt76.wq, &dev->reset_work);
+	wake_up(&dev->reset_wait);
 }
 
 void mt7996_mac_reset_work(struct work_struct *work)
@@ -2725,6 +2763,7 @@ void mt7996_mac_reset_work(struct work_struct *work)
 
 	mt76_wr(dev, MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_RESET_DONE);
 	mt7996_wait_reset_state(dev, MT_MCU_CMD_NORMAL_STATE);
+	mt7996_mac_reset_sta_ps(dev);
 
 	/* enable DMA Rx/Tx and interrupt */
 	mt7996_dma_start(dev, false, false);
@@ -2869,11 +2908,13 @@ skip_coredump:
 
 void mt7996_reset(struct mt7996_dev *dev)
 {
+	spin_lock_bh(&dev->mt76.lock);
+
 	if (!dev->recovery.hw_init_done)
-		return;
+		goto out;
 
 	if (dev->recovery.hw_full_reset)
-		return;
+		goto out;
 
 	/* wm/wa exception: do full recovery */
 	if (READ_ONCE(dev->recovery.state) & MT_MCU_CMD_WDT_MASK) {
@@ -2884,7 +2925,7 @@ void mt7996_reset(struct mt7996_dev *dev)
 
 		mt7996_irq_disable(dev, MT_INT_MCU_CMD);
 		queue_work(dev->mt76.wq, &dev->dump_work);
-		return;
+		goto out;
 	}
 
 	if (READ_ONCE(dev->recovery.state) & MT_MCU_CMD_STOP_DMA) {
@@ -2894,6 +2935,8 @@ void mt7996_reset(struct mt7996_dev *dev)
 
 	queue_work(dev->mt76.wq, &dev->reset_work);
 	wake_up(&dev->reset_wait);
+out:
+	spin_unlock_bh(&dev->mt76.lock);
 }
 
 void mt7996_mac_update_stats(struct mt7996_phy *phy)
@@ -3401,15 +3444,18 @@ void mt7996_mac_add_twt_setup(struct ieee80211_hw *hw,
 	}
 	flow->tsf = le64_to_cpu(twt_agrt->twt);
 
+	WRITE_ONCE(msta_link->twt.flowid_mask,
+		   msta_link->twt.flowid_mask | BIT(flowid));
 	if (mt7996_mcu_twt_agrt_update(dev, &msta->vif->deflink, flow,
 				       MCU_TWT_AGRT_ADD)) {
+		WRITE_ONCE(msta_link->twt.flowid_mask,
+			   msta_link->twt.flowid_mask & ~BIT(flowid));
 		list_del(&flow->list);
 		goto unlock;
 	}
 
 	setup_cmd = TWT_SETUP_CMD_ACCEPT;
 	dev->twt.table_mask |= BIT(table_id);
-	msta_link->twt.flowid_mask |= BIT(flowid);
 	dev->twt.n_agrt++;
 
 unlock:
@@ -3441,7 +3487,8 @@ void mt7996_mac_twt_teardown_flow(struct mt7996_dev *dev,
 		return;
 
 	list_del_init(&flow->list);
-	msta_link->twt.flowid_mask &= ~BIT(flowid);
+	WRITE_ONCE(msta_link->twt.flowid_mask,
+		   msta_link->twt.flowid_mask & ~BIT(flowid));
 	dev->twt.table_mask &= ~BIT(flow->table_id);
 	dev->twt.n_agrt--;
 }

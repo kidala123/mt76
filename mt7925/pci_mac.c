@@ -24,6 +24,9 @@ int mt7925e_tx_prepare_skb(struct mt76_dev *mdev, void *txwi_ptr,
 	if (unlikely(tx_info->skb->len <= ETH_HLEN))
 		return -EINVAL;
 
+	if (is_mt7928(&dev->mt76))
+		mt792x_perf_account_tx(dev, info->control.vif, tx_info->skb->len);
+
 	if (!wcid)
 		wcid = &dev->mt76.global_wcid;
 
@@ -198,6 +201,12 @@ int mt7925e_mac_reset(struct mt792x_dev *dev)
 
 	if (is_mt7927(&dev->mt76)) {
 		err = mt7925_mcu_set_dbdc(&dev->mphy, true);
+		if (err)
+			goto out;
+	}
+
+	if (is_mt7928(&dev->mt76)) {
+		err = mt792x_mcu_set_dyn_pcie_gen(dev);
 		if (err)
 			goto out;
 	}

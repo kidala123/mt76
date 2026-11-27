@@ -18,9 +18,13 @@
 #define MT7996_WTBL_RESERVED		(mt7996_wtbl_size(dev) - 1)
 #define MT7996_WTBL_STA			(MT7996_WTBL_RESERVED - \
 					 mt7996_max_interface_num(dev))
+#define MT7996_DUP_WTBL_NUM		80
 
 #define MT7996_WATCHDOG_TIME		(HZ / 10)
 #define MT7996_RESET_TIMEOUT		(30 * HZ)
+#define MT7996_TSF_READ_TRIES		3
+#define MT7996_TSF_READ_SPAN_US		1000
+#define MT7996_TSF_WRITE_TRIES		2
 
 #define MT7996_TX_RING_SIZE		2048
 #define MT7996_TX_MCU_RING_SIZE		256
@@ -512,9 +516,9 @@ struct mt7996_dev {
 		u32 state;
 		u32 wa_reset_count;
 		u32 wm_reset_count;
-		bool hw_full_reset:1;
-		bool hw_init_done:1;
-		bool restart:1;
+		bool hw_full_reset;
+		bool hw_init_done;
+		bool restart;
 	} recovery;
 
 	/* protects coredump data */
@@ -794,6 +798,7 @@ int mt7996_init_tx_queues(struct mt7996_phy *phy, int idx,
 void mt7996_init_txpower(struct mt7996_phy *phy);
 int mt7996_txbf_init(struct mt7996_dev *dev);
 void mt7996_reset(struct mt7996_dev *dev);
+void mt7996_mac_full_reset_queue(struct mt7996_dev *dev);
 int mt7996_run(struct mt7996_phy *phy);
 int mt7996_mcu_init(struct mt7996_dev *dev);
 int mt7996_mcu_init_firmware(struct mt7996_dev *dev);
@@ -934,6 +939,19 @@ static inline u8 mt7996_max_interface_num(struct mt7996_dev *dev)
 static inline u16 mt7996_wtbl_size(struct mt7996_dev *dev)
 {
 	return (dev->wtbl_size_group << 8) + MT7996_WTBL_BMC_SIZE;
+}
+
+static inline u16 mt7996_dup_wtbl_base(struct mt7996_dev *dev)
+{
+	return min_t(u16, MT7996_WTBL_STA + 1, 0x400) - MT7996_DUP_WTBL_NUM;
+}
+
+static inline u16 mt7996_wtbl_sta_limit(struct mt7996_dev *dev)
+{
+	if (is_mt7990(&dev->mt76))
+		return MT7996_WTBL_STA;
+
+	return mt7996_dup_wtbl_base(dev);
 }
 
 void mt7996_dual_hif_set_irq_mask(struct mt7996_dev *dev, bool write_reg,

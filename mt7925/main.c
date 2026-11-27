@@ -449,6 +449,7 @@ static int mt7925_mac_link_bss_add(struct mt792x_dev *dev,
 	mlink->wcid.idx = idx;
 	mlink->wcid.tx_info |= MT_WCID_TX_INFO_SET;
 	mt76_wcid_init(&mlink->wcid, 0);
+	mt76_wcid_rx_group_pn_set(&mlink->wcid, vif, &mconf->mt76.rx_group_pn);
 
 	mt7925_mac_wtbl_update(dev, idx,
 			       MT_WTBL_UPDATE_ADM_COUNT_CLEAR);
@@ -804,11 +805,11 @@ static int mt7925_set_link_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
 	else
 		goto out;
 
-	if (sta)
-		mt76_wcid_key_link_setup(wcid, cmd == SET_KEY ? key : NULL);
-	else
+	if (!sta)
 		mt76_wcid_key_setup(&dev->mt76, wcid,
 				    cmd == SET_KEY ? key : NULL);
+	else if (cmd == SET_KEY)
+		mt76_wcid_key_link_setup(wcid, key);
 
 	err = mt7925_mcu_add_key(&dev->mt76, vif, &mlink->bip,
 				 key, MCU_UNI_CMD(STA_REC_UPDATE),
@@ -853,7 +854,7 @@ static int mt7925_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
 	struct mt792x_sta *msta = sta ? (struct mt792x_sta *)sta->drv_priv :
 				  &mvif->sta;
 	struct mt792x_link_sta *mlink;
-	int err;
+	int err = 0;
 
 	/* Route NAN/NAN_DATA keys.
 	 *
@@ -2028,6 +2029,10 @@ static int mt7925_resume(struct ieee80211_hw *hw)
 	set_bit(MT76_STATE_RUNNING, &phy->mt76->state);
 	ieee80211_iterate_active_interfaces_mtx(hw,
 						IEEE80211_IFACE_ITER_RESUME_ALL,
+						mt792x_rx_group_pn_reset_iter,
+						NULL);
+	ieee80211_iterate_active_interfaces_mtx(hw,
+						IEEE80211_IFACE_ITER_RESUME_ALL,
 						mt7925_mcu_set_suspend_iter,
 						&dev->mphy);
 
@@ -2043,10 +2048,12 @@ static void mt7925_set_rekey_data(struct ieee80211_hw *hw,
 				  struct ieee80211_vif *vif,
 				  struct cfg80211_gtk_rekey_data *data)
 {
+	struct mt792x_vif *mvif = (struct mt792x_vif *)vif->drv_priv;
 	struct mt792x_dev *dev = mt792x_hw_dev(hw);
 
 	mt792x_mutex_acquire(dev);
 	mt76_connac_mcu_update_gtk_rekey(hw, vif, data);
+	mvif->gtk_rekey_offload = true;
 	mt792x_mutex_release(dev);
 }
 #endif /* CONFIG_PM */
@@ -2467,9 +2474,15 @@ static void mt7925_vif_cfg_changed(struct ieee80211_hw *hw,
 				      &mvif->sta.deflink, true,
 				      MT76_STA_INFO_STATE_ASSOC, NULL);
 		mt7925_mcu_set_beacon_filter(dev, vif, vif->cfg.assoc);
+		if (!vif->cfg.assoc)
+			mt792x_rx_group_pn_forget(vif);
 
 		if (ieee80211_vif_is_mld(vif))
 			mvif->mlo_pm_state = MT792x_MLO_LINK_ASSOC;
+
+		/* PERF_IND is supported on MT7928 only within this family */
+		if (is_mt7928(&dev->mt76))
+			mt792x_perf_ind_update(dev, vif, MT792x_PERF_IND_TIME);
 	}
 
 	if (changed & BSS_CHANGED_ARP_FILTER) {

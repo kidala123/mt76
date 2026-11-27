@@ -356,6 +356,20 @@ static void mt7996_vif_link_free(struct mt7996_vif_link *link,
 	kfree_rcu(mlink, rcu_head);
 }
 
+static void mt7996_vif_deflink_init(struct ieee80211_vif *vif,
+				    struct mt7996_vif_link *link)
+{
+	struct mt7996_vif *mvif = (struct mt7996_vif *)vif->drv_priv;
+	struct mt76_txq *mtxq;
+
+	if (!vif->txq || mvif->mt76.deflink_id != IEEE80211_LINK_UNSPECIFIED)
+		return;
+
+	mtxq = (struct mt76_txq *)vif->txq->drv_priv;
+	mvif->mt76.deflink_id = link->msta_link.wcid.link_id;
+	mtxq->wcid = link->msta_link.wcid.idx;
+}
+
 static int mt7996_vif_link_reuse(struct mt7996_phy *phy,
 				 struct ieee80211_vif *vif,
 				 struct ieee80211_bss_conf *link_conf,
@@ -369,10 +383,16 @@ static int mt7996_vif_link_reuse(struct mt7996_phy *phy,
 		return ret;
 
 	if (vif->type == NL80211_IFTYPE_AP && ieee80211_vif_is_mld(vif))
-		return mt7996_mcu_mld_link_oper(phy->dev, link_conf, link, true);
+		ret = mt7996_mcu_mld_link_oper(phy->dev, link_conf, link, true);
+	else
+		ret = mt7996_mcu_add_bss_info(phy, vif, link_conf, mlink,
+					      &link->msta_link, true);
+	if (ret)
+		return ret;
 
-	return mt7996_mcu_add_bss_info(phy, vif, link_conf, mlink,
-				       &link->msta_link, true);
+	mt7996_vif_deflink_init(vif, link);
+
+	return 0;
 }
 
 int mt7996_vif_link_add(struct mt76_phy *mphy, struct ieee80211_vif *vif,
@@ -449,6 +469,7 @@ int mt7996_vif_link_add(struct mt76_phy *mphy, struct ieee80211_vif *vif,
 	msta_link->wcid.link_valid = ieee80211_vif_is_mld(vif);
 	msta_link->wcid.tx_info |= MT_WCID_TX_INFO_SET;
 	mt76_wcid_init(&msta_link->wcid, band_idx);
+	mt76_wcid_rx_group_pn_set(&msta_link->wcid, vif, &mlink->rx_group_pn);
 
 	if (vif->type != NL80211_IFTYPE_AP &&
 	    (!mlink->omac_idx || mlink->omac_idx > 3))
@@ -476,14 +497,7 @@ int mt7996_vif_link_add(struct mt76_phy *mphy, struct ieee80211_vif *vif,
 		ieee80211_iter_keys(mphy->hw, vif, mt7996_key_iter, &it);
 
 	if (!mlink->wcid->offchannel) {
-		if (vif->txq &&
-		    mvif->mt76.deflink_id == IEEE80211_LINK_UNSPECIFIED) {
-			struct mt76_txq *mtxq;
-
-			mtxq = (struct mt76_txq *)vif->txq->drv_priv;
-			mvif->mt76.deflink_id = link_conf->link_id;
-			mtxq->wcid = idx;
-		}
+		mt7996_vif_deflink_init(vif, link);
 		mvif->mt76.valid_links |= BIT(link_conf->link_id);
 	}
 
@@ -565,10 +579,8 @@ void mt7996_vif_link_remove(struct mt76_phy *mphy, struct ieee80211_vif *vif,
 
 		if (vif->txq && mvif->mt76.deflink_id == link_id) {
 			struct ieee80211_bss_conf *iter;
-			struct mt76_txq *mtxq;
 
 			mvif->mt76.deflink_id = IEEE80211_LINK_UNSPECIFIED;
-			mtxq = (struct mt76_txq *)vif->txq->drv_priv;
 			/* Primary link will be removed, look for a new one */
 			for_each_vif_active_link(vif, iter, link_id) {
 				if (link_id == msta_link->wcid.link_id)
@@ -578,8 +590,7 @@ void mt7996_vif_link_remove(struct mt76_phy *mphy, struct ieee80211_vif *vif,
 				if (!link)
 					continue;
 
-				mtxq->wcid = link->msta_link.wcid.idx;
-				mvif->mt76.deflink_id = link_id;
+				mt7996_vif_deflink_init(vif, link);
 				break;
 			}
 		}
@@ -891,6 +902,12 @@ static int mt7996_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
 	}
 
 	for_each_set_bit(link_id, &links, IEEE80211_MLD_MAX_NUM_LINKS) {
+		struct mt7996_vif_link *link = mt7996_vif_link(dev, vif, link_id);
+
+		/* a replay of the key at a link add must keep the counters */
+		if (!sta && link && cmd == SET_KEY)
+			mt76_wcid_key_setup(&dev->mt76, &link->msta_link.wcid, key);
+
 		err = mt7996_set_hw_key(hw, cmd, vif, sta, link_id, key);
 		if (err)
 			break;
@@ -981,10 +998,20 @@ mt7996_get_txpower(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 		   unsigned int link_id, int *dbm)
 {
 	struct mt7996_vif *mvif = (struct mt7996_vif *)vif->drv_priv;
-	struct mt7996_phy *phy = mt7996_vif_link_phy(&mvif->deflink);
 	struct mt7996_dev *dev = mt7996_hw_dev(hw);
+	struct mt7996_phy *phy = NULL;
+	struct mt76_vif_link *mlink;
 	struct wireless_dev *wdev;
 	int n_chains, delta, i;
+
+	rcu_read_lock();
+	mlink = link_id ? rcu_dereference(mvif->mt76.link[link_id]) :
+			  &mvif->deflink.mt76;
+	if (mlink)
+		phy = mt7996_vif_link_phy(container_of(mlink,
+						       struct mt7996_vif_link,
+						       mt76));
+	rcu_read_unlock();
 
 	if (!phy) {
 		wdev = ieee80211_vif_to_wdev(vif);
@@ -1363,7 +1390,7 @@ mt7996_mac_sta_init_link(struct mt7996_dev *dev,
 	if (!phy)
 		return -EINVAL;
 
-	idx = mt76_wcid_alloc(dev->mt76.wcid_mask, MT7996_WTBL_STA);
+	idx = mt76_wcid_alloc(dev->mt76.wcid_mask, mt7996_wtbl_sta_limit(dev));
 	if (idx < 0)
 		return -ENOSPC;
 
@@ -1390,6 +1417,7 @@ mt7996_mac_sta_init_link(struct mt7996_dev *dev,
 	msta_link->wcid.link_id = link_id;
 	msta_link->wcid.link_valid = !!sta->valid_links;
 	msta_link->wcid.def_wcid = &msta->deflink.wcid;
+	clear_bit(MT_WCID_FLAG_PS, &msta_link->wcid.flags);
 
 	if (link_sta->sta->tdls)
 		set_bit(MT_WCID_FLAG_TDLS_PEER, &msta_link->wcid.flags);
@@ -2049,7 +2077,7 @@ mt7996_mac_sta_remove(struct mt7996_dev *dev, struct ieee80211_vif *vif,
 		if (msta_link->twt.flowid_mask & BIT(i))
 			list_del_init(&msta_link->twt.flow[i].list);
 	}
-	msta_link->twt.flowid_mask = 0;
+	WRITE_ONCE(msta_link->twt.flowid_mask, 0);
 
 	for (i = 0; i < ARRAY_SIZE(msta->link); i++)
 		mt7996_mac_sta_remove_link(dev, sta, i, true);
@@ -2374,15 +2402,29 @@ mt7996_get_stats(struct ieee80211_hw *hw,
 	return 0;
 }
 
-u64 __mt7996_get_tsf(struct ieee80211_hw *hw, struct mt7996_vif_link *link)
+static u64 mt7996_tsf_latch(struct mt7996_dev *dev, u8 band, u16 n)
 {
-	struct mt7996_phy *phy = mt7996_vif_link_phy(link);
-	struct mt7996_dev *dev = mt7996_hw_dev(hw);
 	union {
 		u64 t64;
 		u32 t32[2];
 	} tsf;
+
+	mt76_rmw(dev, MT_LPON_TCR(band, n), MT_LPON_TCR_SW_MODE,
+		 MT_LPON_TCR_SW_READ);
+	tsf.t32[0] = mt76_rr(dev, MT_LPON_UTTR0(band));
+	tsf.t32[1] = mt76_rr(dev, MT_LPON_UTTR1(band));
+
+	return tsf.t64;
+}
+
+u64 __mt7996_get_tsf(struct ieee80211_hw *hw, struct mt7996_vif_link *link)
+{
+	struct mt7996_phy *phy = mt7996_vif_link_phy(link);
+	struct mt7996_dev *dev = mt7996_hw_dev(hw);
+	u64 first = 0, tsf = 0;
+	u8 band;
 	u16 n;
+	int i;
 
 	if (!phy)
 		return 0;
@@ -2391,13 +2433,20 @@ u64 __mt7996_get_tsf(struct ieee80211_hw *hw, struct mt7996_vif_link *link)
 
 	n = link->mt76.omac_idx > HW_BSSID_MAX ? HW_BSSID_0
 					       : link->mt76.omac_idx;
-	/* TSF software read */
-	mt76_rmw(dev, MT_LPON_TCR(phy->mt76->band_idx, n), MT_LPON_TCR_SW_MODE,
-		 MT_LPON_TCR_SW_READ);
-	tsf.t32[0] = mt76_rr(dev, MT_LPON_UTTR0(phy->mt76->band_idx));
-	tsf.t32[1] = mt76_rr(dev, MT_LPON_UTTR1(phy->mt76->band_idx));
+	band = phy->mt76->band_idx;
 
-	return tsf.t64;
+	for (i = 0; i < MT7996_TSF_READ_TRIES; i++) {
+		first = mt7996_tsf_latch(dev, band, n);
+		tsf = mt7996_tsf_latch(dev, band, n);
+		if (tsf - first <= MT7996_TSF_READ_SPAN_US)
+			return tsf;
+	}
+
+	dev_warn_once(dev->mt76.dev,
+		      "TSF reads of band %u do not agree: %llu, %llu\n",
+		      band, first, tsf);
+
+	return tsf;
 }
 
 static u64
@@ -2415,6 +2464,20 @@ mt7996_get_tsf(struct ieee80211_hw *hw, struct ieee80211_vif *vif)
 }
 
 static void
+mt7996_tsf_load(struct mt7996_dev *dev, u8 band, u16 n, u64 val, u32 mode)
+{
+	union {
+		u64 t64;
+		u32 t32[2];
+	} tsf = { .t64 = val, };
+
+	mt76_wr(dev, MT_LPON_UTTR0(band), tsf.t32[0]);
+	mt76_wr(dev, MT_LPON_UTTR1(band), tsf.t32[1]);
+	mt76_rmw(dev, MT_LPON_TCR(band, n), MT_LPON_TCR_SW_MODE, mode);
+	mt76_clear(dev, MT_LPON_TCR(band, n), MT_LPON_TCR_SW_MODE);
+}
+
+static void
 mt7996_set_tsf(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 	       u64 timestamp)
 {
@@ -2422,11 +2485,8 @@ mt7996_set_tsf(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 	struct mt7996_dev *dev = mt7996_hw_dev(hw);
 	struct mt7996_vif_link *link;
 	struct mt7996_phy *phy;
-	union {
-		u64 t64;
-		u32 t32[2];
-	} tsf = { .t64 = timestamp, };
 	u16 n;
+	int i;
 
 	mutex_lock(&dev->mt76.mutex);
 
@@ -2440,11 +2500,13 @@ mt7996_set_tsf(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 	if (!phy)
 		goto unlock;
 
-	mt76_wr(dev, MT_LPON_UTTR0(phy->mt76->band_idx), tsf.t32[0]);
-	mt76_wr(dev, MT_LPON_UTTR1(phy->mt76->band_idx), tsf.t32[1]);
-	/* TSF software overwrite */
-	mt76_rmw(dev, MT_LPON_TCR(phy->mt76->band_idx, n), MT_LPON_TCR_SW_MODE,
-		 MT_LPON_TCR_SW_WRITE);
+	for (i = 0; i < MT7996_TSF_WRITE_TRIES; i++) {
+		mt7996_tsf_load(dev, phy->mt76->band_idx, n, timestamp,
+				MT_LPON_TCR_SW_WRITE);
+		if (__mt7996_get_tsf(hw, link) - timestamp <=
+		    MT7996_TSF_READ_SPAN_US)
+			break;
+	}
 
 unlock:
 	mutex_unlock(&dev->mt76.mutex);
@@ -2458,10 +2520,6 @@ mt7996_offset_tsf(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 	struct mt7996_dev *dev = mt7996_hw_dev(hw);
 	struct mt7996_vif_link *link;
 	struct mt7996_phy *phy;
-	union {
-		u64 t64;
-		u32 t32[2];
-	} tsf = { .t64 = timestamp, };
 	u16 n;
 
 	mutex_lock(&dev->mt76.mutex);
@@ -2476,11 +2534,8 @@ mt7996_offset_tsf(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 
 	n = link->mt76.omac_idx > HW_BSSID_MAX ? HW_BSSID_0
 					       : link->mt76.omac_idx;
-	mt76_wr(dev, MT_LPON_UTTR0(phy->mt76->band_idx), tsf.t32[0]);
-	mt76_wr(dev, MT_LPON_UTTR1(phy->mt76->band_idx), tsf.t32[1]);
-	/* TSF software adjust*/
-	mt76_rmw(dev, MT_LPON_TCR(phy->mt76->band_idx, n), MT_LPON_TCR_SW_MODE,
-		 MT_LPON_TCR_SW_ADJUST);
+	mt7996_tsf_load(dev, phy->mt76->band_idx, n, timestamp,
+			MT_LPON_TCR_SW_ADJUST);
 
 unlock:
 	mutex_unlock(&dev->mt76.mutex);
@@ -3310,7 +3365,8 @@ mt7996_net_fill_forward_path(struct ieee80211_hw *hw,
 	if (!msta_link)
 		return -EIO;
 
-	if (!msta_link->wcid.sta || msta_link->wcid.idx > MT7996_WTBL_STA)
+	if (!msta_link->wcid.sta ||
+	    msta_link->wcid.idx >= mt7996_wtbl_sta_limit(dev))
 		return -EIO;
 
 	wed = mt7996_sta_wed(dev, msta_link);

@@ -120,6 +120,8 @@ static void mt7925e_unregister_device(struct mt792x_dev *dev)
 	mt76_unregister_device(&dev->mt76);
 	set_bit(MT76_REMOVED, &dev->mphy.state);
 	cancel_work_sync(&dev->reset_work);
+	if (is_mt7928(&dev->mt76))
+		cancel_delayed_work_sync(&dev->perf.work);
 	mt792x_reset_vif_work_cancel(dev);
 	mt76_for_each_q_rx(&dev->mt76, i)
 		napi_disable(&dev->mt76.napi[i]);
@@ -475,16 +477,17 @@ static int mt7927_dma_init(struct mt792x_dev *dev)
 
 static void mt7928_dma_shdl_lite_init(struct mt792x_dev *dev)
 {
-	u32 addr, idx, grp1_5_quota, grp15_quota;
+	u32 addr, idx, grp0_quota, grp15_quota;
+	/* Driver only uses TX ring 0, map all queues to group 0 */
 	u32 q2group[8] = {
-		0x04000000, /* AC00->G0,..., AC03->G4 */
-		0x04010101, /* AC10->G1,..., AC13->G4 */
-		0x04020202, /* AC20->G2,..., AC23->G4 */
-		0x04030303, /* AC30->G3,..., AC33->G4 */
-		0x00000005, /* ALTX->G5,BMC->G0,BCN->G0 */
-		0x00000005, /* TGID=1 ALTX->G5 */
-		0x00000000, /* NAF/NBCN/FIXFID -> G0 */
-		0x00000005, /* TGID=2 ALTX->G5 */
+		0x00000000, /* All queues -> G0 */
+		0x00000000, /* All queues -> G0 */
+		0x00000000, /* All queues -> G0 */
+		0x00000000, /* All queues -> G0 */
+		0x00000000, /* All queues -> G0 */
+		0x00000000, /* All queues -> G0 */
+		0x00000000, /* All queues -> G0 */
+		0x00000000, /* All queues -> G0 */
 	};
 
 	/* RST */
@@ -507,18 +510,18 @@ static void mt7928_dma_shdl_lite_init(struct mt792x_dev *dev)
 	     idx < ARRAY_SIZE(q2group);
 	     idx++, addr += 4)
 		mt76_wr(dev, addr, q2group[idx]);
-	/* refill, set 0 to enable group 0,1,2,3,4,5 & 15 */
-	mt76_wr(dev, MT_DMASHDL_LITE_GROUP_DISABLE0, 0xffff7fc0);
+	/* refill, set 0 to enable group 0 & 15 */
+	mt76_wr(dev, MT_DMASHDL_LITE_GROUP_DISABLE0, 0xffff7ffe);
 	mt76_wr(dev, MT_DMASHDL_LITE_GROUP_DISABLE1, 0xffffffff);
 	/* max/min quota */
-	grp1_5_quota = FIELD_PREP(MT_DMASHDL_LITE_GROUP_MAX_QUOTA_MASK, 0x3f0) |
-		       FIELD_PREP(MT_DMASHDL_LITE_GROUP_MIN_QUOTA_MASK, 0x10);
+	grp0_quota = FIELD_PREP(MT_DMASHDL_LITE_GROUP_MAX_QUOTA_MASK, 0x700) |
+		     FIELD_PREP(MT_DMASHDL_LITE_GROUP_MIN_QUOTA_MASK, 0x10);
 	grp15_quota = FIELD_PREP(MT_DMASHDL_LITE_GROUP_MAX_QUOTA_MASK, 0x30);
 
 	for (addr = MT_DMASHDL_LITE_GROUP0_QUOTA, idx = 0;
 	     idx < DMASHDL_LITE_GROUP_NUM;
 	     idx++, addr += 4)
-		mt76_wr(dev, addr, (idx <= 5) ? grp1_5_quota :
+		mt76_wr(dev, addr, (idx == 0) ? grp0_quota :
 			((idx == 15) ? grp15_quota : 0));
 }
 
@@ -778,6 +781,15 @@ static int mt7925_pci_probe(struct pci_dev *pdev,
 	if (ret)
 		goto err_free_dma;
 
+	/* PERF_IND is only supported on MT7928 in this family;
+	 * MT7925 and MT7927 opt out.
+	 * The periodic indication itself is started on association.
+	 */
+	if (is_mt7928(&dev->mt76)) {
+		dev->perf.enabled = true;
+		mt792x_perf_ind_init(dev);
+	}
+
 	return 0;
 
 err_free_dma:
@@ -814,6 +826,8 @@ static int mt7925_pci_suspend(struct device *device)
 	pm->suspended = true;
 	dev->hif_resumed = false;
 	flush_work(&dev->reset_work);
+	if (is_mt7928(&dev->mt76))
+		cancel_delayed_work_sync(&dev->perf.work);
 	cancel_delayed_work_sync(&pm->ps_work);
 	cancel_delayed_work_sync(&dev->mlo_pm_work);
 	cancel_work_sync(&pm->wake_work);
@@ -949,6 +963,10 @@ static int _mt7925_pci_resume(struct device *device, bool restore)
 		mt7925_mcu_set_deep_sleep(dev, false);
 
 	mt7925_mcu_regd_update(dev, mdev->alpha2, dev->country_ie_env);
+
+	/* re-arm the periodic performance indication if any bss is connected */
+	if (is_mt7928(&dev->mt76))
+		mt792x_perf_ind_resched(dev);
 failed:
 	pm->suspended = false;
 
@@ -973,6 +991,17 @@ static int mt7925_pci_restore(struct device *device)
 	return _mt7925_pci_resume(device, true);
 }
 
+static void mt7925_coredump(struct device *dev)
+{
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct mt76_dev *mdev = pci_get_drvdata(pdev);
+	struct mt792x_dev *dev_792x = container_of(mdev, struct mt792x_dev, mt76);
+
+	mt792x_mutex_acquire(dev_792x);
+	mt792x_mcu_chip_config(dev_792x, "assert");
+	mt792x_mutex_release(dev_792x);
+}
+
 static const struct dev_pm_ops mt7925_pm_ops = {
 	.suspend = pm_sleep_ptr(mt7925_pci_suspend),
 	.resume  = pm_sleep_ptr(mt7925_pci_resume),
@@ -989,6 +1018,7 @@ static struct pci_driver mt7925_pci_driver = {
 	.remove		= mt7925_pci_remove,
 	.shutdown       = mt7925_pci_shutdown,
 	.driver.pm	= pm_sleep_ptr(&mt7925_pm_ops),
+	.driver.coredump = mt7925_coredump,
 };
 
 module_pci_driver(mt7925_pci_driver);

@@ -6,6 +6,11 @@
 
 #include "../mt76_connac_mcu.h"
 
+/* host flag: an L1 SER frees every template and the L1 work uploads it again */
+#define MT7915_MCU_CMD_BCN_TEMPLATE	BIT(21)
+/* host flag: the pending reset that refuses an L1 trigger takes its place */
+#define MT7915_MCU_CMD_L1_TRIGGER	BIT(22)
+
 enum {
 	MCU_ATE_SET_TRX = 0x1,
 	MCU_ATE_SET_FREQ_OFFSET = 0xa,
@@ -60,7 +65,7 @@ struct mt7915_mcu_ps_notify {
 	u8 wtbl_lower;
 	u8 ps_bit;
 	u8 wtbl_higher;
-	u8 rsv;
+	u8 path;
 } __packed;
 
 struct mt7915_mcu_ps_notify_v2 {
@@ -68,10 +73,15 @@ struct mt7915_mcu_ps_notify_v2 {
 
 	__le16 wtbl_lower;
 	__le16 wtbl_higher;
-	__le16 rsv;
+	__le16 path;
 	u8 ps_bit;
-	u8 rsv2;
+	u8 rsv;
 } __packed;
+
+enum {
+	MT7915_PS_SYNC_TWT_MANY = 0x08,
+	MT7915_PS_SYNC_TWT = 0x80,
+};
 
 struct mt7915_mcu_rdd_report {
 	struct mt76_connac2_mcu_rxd_hdr rxd;
